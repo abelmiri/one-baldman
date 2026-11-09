@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { ClothLab, type Mode, type Settings } from './ClothLab'
+import { ClothLab, type Mode, type MovementDirection, type Settings } from './ClothLab'
 import './style.css'
 
 const initial: Settings = {
-  mode: 'hanging', wind: 4, windDirection: 90, gravity: 9.8, stiffness: 32, playing: true,
+  mode: 'cape', wind: 4, windDirection: 90, gravity: 9.8, stiffness: 32, playing: true, standing: true,
+  gait: 'walk', sitting: false,
 }
 
 function Slider({ label, value, min, max, step, unit = '', onChange }: {
@@ -24,12 +25,14 @@ function App() {
   const [settings, setSettings] = useState<Settings>(initial)
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
+  const [grabbed, setGrabbed] = useState('')
 
   useEffect(() => {
     let cancelled = false
     try {
       if (!cancelled && host.current) {
-        lab.current = new ClothLab(host.current, initial)
+        lab.current = new ClothLab(host.current, initial, setGrabbed,
+          (sitting) => setSettings((current) => ({ ...current, sitting })))
         setReady(true)
       }
     } catch (reason) {
@@ -46,6 +49,7 @@ function App() {
 
   const change = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setSettings((current) => ({ ...current, [key]: value }))
+  const movementDisabled = !settings.playing || !settings.standing
 
   return <main className="app-shell">
     <header className="topbar">
@@ -58,17 +62,44 @@ function App() {
         <div className="panel-intro">
           <span className="eyebrow">CLOTH LAB / 01</span>
           <h1>پارچه در حرکت</h1>
-          <p>باد، گرانش و برخورد را تغییر دهید و رفتار پارچه را همان لحظه ببینید.</p>
+          <p>اندام‌های آدمک را بگیرید؛ حرکت مفصل‌ها و برخورد بدن با پارچه را همان لحظه ببینید.</p>
+        </div>
+
+        <div className="control-group movement-controls">
+          <span className="group-label">کنترل حرکت</span>
+          <div className="segmented" role="group" aria-label="سرعت حرکت">
+            {([['walk', 'راه‌رفتن'], ['run', 'دویدن']] as const).map(([gait, label]) =>
+              <button key={gait} type="button" className={settings.gait === gait ? 'active' : ''}
+                disabled={movementDisabled} aria-pressed={settings.gait === gait}
+                onClick={() => change('gait', gait)}>{label}</button>,
+            )}
+          </div>
+          <button type="button" className="secondary-button sit-button" disabled={movementDisabled}
+            aria-pressed={settings.sitting} onClick={() => change('sitting', !settings.sitting)}>
+            {settings.sitting ? 'بلندشدن' : 'نشستن'} <kbd>C</kbd>
+          </button>
+          <p className="scene-note">{!settings.standing ? 'برای کنترل حرکت، کمک به ایستادن را روشن کنید.'
+            : 'حرکت: WASD یا جهت‌ها · دویدن: Shift · نشستن و بلندشدن: C'}</p>
+        </div>
+
+        <div className="control-group mannequin-controls">
+          <span className="group-label">آدمک مفصل‌دار</span>
+          <label className="toggle-row">
+            <span>کمک به ایستادن</span>
+            <input type="checkbox" checked={settings.standing} onChange={(event) => change('standing', event.target.checked)} />
+          </label>
+          <p className="mannequin-note">برای سقوط آزاد خاموش کنید. دست، بازو، سینه، لگن یا پا را با موس یا لمس بکشید.</p>
         </div>
 
         <div className="control-group">
           <span className="group-label">حالت صحنه</span>
           <div className="segmented" role="group" aria-label="حالت صحنه">
-            {([['hanging', 'آویزان'], ['falling', 'رهاشونده']] as [Mode, string][]).map(([mode, label]) =>
+            {([['cape', 'شنل'], ['falling', 'رهاشونده']] as [Mode, string][]).map(([mode, label]) =>
               <button key={mode} type="button" className={settings.mode === mode ? 'active' : ''}
                 aria-pressed={settings.mode === mode} onClick={() => change('mode', mode)}>{label}</button>,
             )}
           </div>
+          <p className="scene-note">{settings.mode === 'cape' ? 'لبهٔ شنل از شانه تا شانه به بدن متصل است.' : 'پارچه آزادانه روی آدمک و زمین می‌افتد.'}</p>
         </div>
 
         <div className="control-group sliders">
@@ -81,7 +112,7 @@ function App() {
             onChange={(value) => change('gravity', value)} />
           <Slider label="سفتی پارچه" value={settings.stiffness} min={10} max={60} step={1}
             onChange={(value) => change('stiffness', value)} />
-          <p className="slider-note">تغییر سفتی، پارچه را از نو می‌سازد.</p>
+          <p className="slider-note">تغییر سفتی، صحنه را بازنشانی می‌کند.</p>
         </div>
 
         <div className="actions">
@@ -92,15 +123,36 @@ function App() {
             <span aria-hidden="true">↻</span> بازنشانی
           </button>
         </div>
-        <div className="panel-foot">فیزیک واقعی پارچه و برخورد سه‌بعدی</div>
+        <div className="panel-foot">۲۱ بخش فیزیکی · مفصل‌های سه‌بعدی · برخورد با پارچه</div>
       </aside>
 
       <section className="viewer" aria-label="نمای سه‌بعدی شبیه‌ساز پارچه">
         <div ref={host} className="canvas-host" />
         {!ready && <div className="loading">{error ? `خطا در بارگذاری: ${error}` : 'در حال آماده‌سازی فیزیک…'}</div>}
-        <div className="viewer-top"><span className="scene-tag">{settings.mode === 'hanging' ? 'صحنه ۱ / آویزان' : 'صحنه ۲ / رهاشونده'}</span></div>
+        <div className="viewer-top"><span className="scene-tag">{settings.mode === 'cape' ? 'صحنه ۱ / شنل متصل از شانه تا شانه' : 'صحنه ۲ / رهاشونده'}</span></div>
+        {grabbed && <div className="grab-label" role="status">در حال گرفتن: {grabbed}</div>}
+        <div className="movement-pad" role="group" aria-label="کنترل جهت حرکت">
+          {([
+            ['forward', '↑', 'حرکت به جلو'], ['left', '←', 'حرکت به چپ'],
+            ['right', '→', 'حرکت به راست'], ['backward', '↓', 'حرکت به عقب'],
+          ] as [MovementDirection, string, string][]).map(([direction, symbol, label]) =>
+            <button key={direction} type="button" className={`move-${direction}`}
+              aria-label={label} title={`${label}؛ نگه دارید`} disabled={movementDisabled}
+              onPointerDown={(event) => {
+                event.preventDefault()
+                event.currentTarget.setPointerCapture(event.pointerId)
+                lab.current?.setTouchDirection(direction, true)
+              }}
+              onPointerUp={(event) => {
+                lab.current?.setTouchDirection(direction, false)
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+              }}
+              onPointerCancel={() => lab.current?.setTouchDirection(direction, false)}
+              onLostPointerCapture={() => lab.current?.setTouchDirection(direction, false)}>{symbol}</button>,
+          )}
+        </div>
         <div className="viewer-bottom">
-          <span>برای جابه‌جایی، کره {settings.mode === 'hanging' ? 'یا میله' : ''} را بکشید</span>
+          <span>{settings.playing ? 'حرکت: WASD / جهت‌ها · دویدن: Shift · نشستن: C' : 'برای حرکت دادن آدمک، ادامه را بزنید'}</span>
           <span className="viewer-hint">چرخش نما: کشیدن فضای خالی · بزرگ‌نمایی: اسکرول</span>
         </div>
       </section>
