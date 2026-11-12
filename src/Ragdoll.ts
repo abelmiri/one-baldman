@@ -1,6 +1,8 @@
 import * as THREE from 'three'
 import RAPIER from '@dimforge/rapier3d'
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js'
+import { CharacterAnimation, type GetUpStyle, type LimbPose } from './CharacterAnimation'
+import { addHeroAppearance } from './HeroAppearance'
 
 type Part = {
   body: RAPIER.RigidBody
@@ -8,7 +10,10 @@ type Part = {
   label: string
   previousPosition: THREE.Vector3
   previousRotation: THREE.Quaternion
+  previousVelocity: THREE.Vector3
   inertia: number
+  targetPosition: THREE.Vector3
+  targetRotation: THREE.Quaternion
 }
 type AngularJoint = {
   parent: Part
@@ -19,50 +24,110 @@ type AngularJoint = {
   stiffness: number
 }
 const v = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z)
-const origin = v(0, 0, 0)
 const STAND_HEIGHT = 1.23
+const RUN_SPEED = 6.40332
+const FLIGHT_BOOST_DURATION = 3.5
+const FLIGHT_BOOST_RELEASE_DURATION = .65
+const PROTECTION_POWER = 100
 
-/** Dynamic mannequin: no animation or mesh-to-body teleporting. */
+type PoseLink = {
+  parent: Part; child: Part; anchor1: THREE.Vector3; anchor2: THREE.Vector3
+  axis?: THREE.Vector3
+}
+
+// Physical bodies never collide with the cape. Kinematic copies provide its
+// collision surface and collar anchors, including while the real body ragdolls.
+const BODY_GROUPS = 0x00040005
+const CAPE_PROXY_GROUPS = 0x00080002
+const COLLAR_PROXY_GROUPS = 0x00100002
+
+type ImpactHandler = (point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void
+
+/** Animated kinematic character; switches to a dynamic ragdoll on impact or X. */
 export class Ragdoll {
   readonly parts = new Map<string, Part>()
   readonly meshes: THREE.Object3D[] = []
   private angularJoints: AngularJoint[] = []
-  private torso: Part[] = []
+  private poseLinks: PoseLink[] = []
+  private legChains: PoseLink[][] = []
+  readonly capeBodies = new Map<string, RAPIER.RigidBody>()
   private ballMotors = new Map<string, AngularJoint>()
   private hinges = new Map<string, RAPIER.RevoluteImpulseJoint>()
-  private poseActive = false
+  private poseActive: boolean | null = null
+  private released = false
+  private recovery: { style: GetUpStyle; age: number; duration: number; height: number; rotation: THREE.Quaternion } | null = null
   private direction = new THREE.Vector3()
   private moveVelocity = new THREE.Vector3()
   private running = false
+  private flightHeld = false
+  private ascentHeld = false
+  private descending = false
+  private viewDirection = new THREE.Vector3(0, 0, 1)
+  private flightThrottle = 0
+  private flightBoost = 0
+  private aiming = false
+  private airborne = false
+  private falling = false
+  private flightBlend = 0
+  private flightPitch = 0
+  private flightBank = 0
+  private flightAge = 0
+  private verticalVelocity = 0
+  private landingImpact = 0
+  private turnRate = 0
+  private animation = new CharacterAnimation()
+  private measuredVelocity = new THREE.Vector3()
+  private pelvisPosition = new THREE.Vector3()
+  private pelvisRotation = new THREE.Quaternion()
+  private poseDt = 1 / 60
+  private poseResponse = 14
+  private ballTargets = new Map<string, THREE.Vector3>()
+  private hingeTargets = new Map<string, number>()
+  private hingeLimits = new Map<string, [number, number]>()
+  private ownBodies = new Set<number>()
+  private groundRay = new RAPIER.Ray(v(0, 0, 0), v(0, -1, 0))
+  private groundHeight = .04
+  private flightRotation = new THREE.Quaternion()
+  private flightEuler = new THREE.Euler(0, 0, 0, 'YXZ')
   private sitting = false
   private sitBlend = 0
   private heading = 0
-  private phase = 0
   private standHeight = STAND_HEIGHT
-  private facing = new THREE.Quaternion()
   private torsoTarget = new THREE.Quaternion()
   private seat: THREE.Group
   private seatBody: RAPIER.RigidBody
   private seatVisible = false
   private seatColliding = false
-  private support: RAPIER.RigidBody
-  private supportJoints: RAPIER.ImpulseJoint[] = []
   private supportTarget: THREE.Vector3
+  private footContacts = [false, false]
   private standing = false
-  private grab: { part: Part; local: THREE.Vector3; handle: RAPIER.RigidBody; supportOffset: THREE.Vector3 } | null = null
-  private grabTarget = new THREE.Vector3()
-  private highlighted: Part | null = null
-  private marker: THREE.Mesh
-  private tether: THREE.Line
   private q1 = new THREE.Quaternion()
   private q2 = new THREE.Quaternion()
   private inverseRotation = new THREE.Quaternion()
   private rotation = new THREE.Vector3()
-  private velocity = new THREE.Vector3()
   private torque = new THREE.Vector3()
+  private velocity = new THREE.Vector3()
   private position = new THREE.Vector3()
+  private impactTime = 0
+  private lastImpactTime = -Infinity
+  private lastImpactPosition = new THREE.Vector3()
+  private impactPoint = new THREE.Vector3()
+  private impactNormal = new THREE.Vector3()
+  private contactPoint = new THREE.Vector3()
+  private contactNormal = new THREE.Vector3()
+  private impactVelocity = new THREE.Vector3()
+  private protection = 0
+  private protectionHold = 0
+  private protectionSide = 0
+  private supported = false
+  private protectionRay = new RAPIER.Ray(v(0, 0, 0), v(0, -1, 0))
+  private disposeAppearance: () => void
 
-  constructor(private world: RAPIER.World, private scene: THREE.Scene, z: number, standing: boolean) {
+  /** Muscle engagement, useful for inspecting the physical protective reflex. */
+  get protectionStrength() { return this.protection }
+
+  constructor(private world: RAPIER.World, private scene: THREE.Scene, z: number, standing: boolean,
+    private onImpact: ImpactHandler = () => {}, onAppearanceReady = () => {}) {
     const point = (x: number, y: number, depth = 0) => v(x, y, z + depth)
     const box = (id: string, label: string, center: THREE.Vector3, size: THREE.Vector3, mass: number, color: string) =>
       this.addPart(id, label, center,
@@ -78,30 +143,29 @@ export class Ragdoll {
       geometry.applyQuaternion(rotation)
       return this.addPart(id, label, a.clone().add(b).multiplyScalar(0.5), geometry,
         RAPIER.ColliderDesc.capsule(Math.max(0.005, length / 2 - radius), radius).setRotation(rotation),
-        mass, '#151b23')
+        mass, '#234db2')
     }
 
-    const pelvis = box('pelvis', 'لگن', point(0, 1.13), v(0.265, 0.17, 0.16), 9, '#11151c')
-    const abdomen = box('abdomen', 'شکم و کمر', point(0, 1.43), v(0.215, 0.135, 0.135), 6, '#1b222b')
-    const chest = box('chest', 'سینه', point(0, 1.77), v(0.30, 0.20, 0.17), 12, '#1c232c')
-    const neck = ball('neck', 'گردن', point(0, 2.055), 0.085, 0.8, '#090c10')
-    const head = ball('head', 'سر', point(0, 2.295), 0.19, 4, '#0a0d12')
-    this.torso = [pelvis, abdomen, chest]
+    const pelvis = box('pelvis', 'لگن', point(0, 1.13), v(0.265, 0.17, 0.16), 9, '#234db2')
+    const abdomen = box('abdomen', 'شکم و کمر', point(0, 1.43), v(0.215, 0.135, 0.135), 6, '#234db2')
+    const chest = box('chest', 'سینه', point(0, 1.77), v(0.30, 0.20, 0.17), 12, '#234db2')
+    const neck = ball('neck', 'گردن', point(0, 2.055), 0.085, 0.8, '#efad87')
+    const head = ball('head', 'سر', point(0, 2.295), 0.19, 4, '#efad87')
     this.spherical(pelvis, abdomen, point(0, 1.30), [0.45, 0.5, 0.35], 16)
     this.spherical(abdomen, chest, point(0, 1.565), [0.4, 0.5, 0.35], 20)
-    this.spherical(chest, neck, point(0, 1.99), [0.35, 0.55, 0.35], 70)
-    this.spherical(neck, head, point(0, 2.12), [0.65, 0.8, 0.5], 50)
+    this.spherical(chest, neck, point(0, 1.99), [0.45, 0.55, 0.35], 70)
+    this.spherical(neck, head, point(0, 2.12), [1.05, 0.8, 0.5], 50)
 
     for (const sign of [-1, 1]) {
       const side = sign === -1 ? 'right' : 'left'
       const label = sign === -1 ? 'راست' : 'چپ'
-      const shoulder = ball(`${side}Shoulder`, `شانهٔ ${label}`, point(sign * 0.385, 1.91), 0.105, 1, '#141a22')
+      const shoulder = ball(`${side}Shoulder`, `شانهٔ ${label}`, point(sign * 0.385, 1.91), 0.13, 1, '#234db2')
       const elbow = point(sign * 0.68, 1.48)
       const wrist = point(sign * 0.82, 1.12)
-      const upperArm = limb(`${side}UpperArm`, `بازوی ${label}`, point(sign * 0.445, 1.86), elbow, 0.092, 2.3)
-      const forearm = limb(`${side}Forearm`, `ساعد ${label}`, elbow, wrist, 0.074, 1.4)
-      const hand = box(`${side}Hand`, `دست و مچ ${label}`, point(sign * 0.85, 0.995, 0.015), v(0.075, 0.115, 0.05), 0.6, '#090c12')
-      this.spherical(chest, shoulder, point(sign * 0.30, 1.91), [1.8, 1.3, 1.5], 3)
+      const upperArm = limb(`${side}UpperArm`, `بازوی ${label}`, point(sign * 0.445, 1.86), elbow, 0.112, 2.3)
+      const forearm = limb(`${side}Forearm`, `ساعد ${label}`, elbow, wrist, 0.087, 1.4)
+      const hand = box(`${side}Hand`, `دست و مچ ${label}`, point(sign * 0.85, 0.995, 0.015), v(0.075, 0.10, 0.055), 0.6, '#efad87')
+      this.spherical(chest, shoulder, point(sign * 0.30, 1.91), [2.8, 1.3, 1.5], 3)
       this.hinge(shoulder, upperArm, point(sign * 0.445, 1.86), v(0, 0, sign), -0.35, 1.65)
       this.hinge(upperArm, forearm, elbow, v(1, 0, 0), -2.5, 0.08)
       this.spherical(forearm, hand, wrist, [0.9, 0.55, 0.6], 2)
@@ -109,20 +173,21 @@ export class Ragdoll {
       const hip = point(sign * 0.17, 1.055)
       const knee = point(sign * 0.205, 0.60)
       const anklePoint = point(sign * 0.225, 0.15)
-      const thigh = limb(`${side}Thigh`, `ران ${label}`, hip, knee, 0.115, 5.5)
-      const shin = limb(`${side}Shin`, `ساق ${label}`, knee, anklePoint, 0.085, 3)
-      const ankle = ball(`${side}Ankle`, `مچ پای ${label}`, anklePoint, 0.068, 0.45, '#0a0d12')
-      const foot = box(`${side}Foot`, `کف پای ${label}`, point(sign * 0.225, 0.015, 0.10), v(0.105, 0.09, 0.205), 0.9, '#0b1018')
+      const thigh = limb(`${side}Thigh`, `ران ${label}`, hip, knee, 0.135, 5.5)
+      const shin = limb(`${side}Shin`, `ساق ${label}`, knee, anklePoint, 0.10, 3)
+      const ankle = ball(`${side}Ankle`, `مچ پای ${label}`, anklePoint, 0.068, 0.45, '#bc2334')
+      const foot = box(`${side}Foot`, `کف پای ${label}`, point(sign * 0.225, 0.015, 0.10), v(0.105, 0.09, 0.205), 0.9, '#bc2334')
       this.spherical(pelvis, thigh, hip, [1.55, 0.7, 0.75], 5)
       this.hinge(thigh, shin, knee, v(1, 0, 0), -0.05, 2.45)
       this.spherical(shin, ankle, anklePoint, [0.3, 0.45, 0.3], 2)
       this.hinge(ankle, foot, point(sign * 0.225, 0.10), v(1, 0, 0), -0.65, 0.75)
     }
-    this.addHeroDetails()
+    this.disposeAppearance = addHeroAppearance(this.parts, onAppearanceReady)
+    this.legChains = ['left', 'right'].map(side => this.poseLinks.filter(({ child }) =>
+      ['Thigh', 'Shin', 'Ankle', 'Foot'].some(limb => child.mesh.userData.partId === side + limb)))
+    this.createCapeBodies()
 
     this.supportTarget = point(0, STAND_HEIGHT)
-    this.support = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased()
-      .setTranslation(this.supportTarget.x, this.supportTarget.y, this.supportTarget.z))
     this.seat = new THREE.Group()
     const seatMaterial = new THREE.MeshStandardMaterial({ color: '#67768a', roughness: 0.65 })
     const seatTop = new THREE.Mesh(new RoundedBoxGeometry(0.70, 0.08, 0.58, 2, 0.025), seatMaterial)
@@ -143,14 +208,6 @@ export class Ragdoll {
     }
     this.seat.visible = false
     scene.add(this.seat)
-    this.marker = new THREE.Mesh(new THREE.SphereGeometry(0.045, 16, 12),
-      new THREE.MeshBasicMaterial({ color: '#526bfa', depthTest: false }))
-    this.marker.renderOrder = 10
-    this.tether = new THREE.Line(new THREE.BufferGeometry().setFromPoints([origin, origin]),
-      new THREE.LineBasicMaterial({ color: '#526bfa', depthTest: false, transparent: true, opacity: 0.75 }))
-    this.tether.renderOrder = 9
-    this.marker.visible = this.tether.visible = false
-    scene.add(this.marker, this.tether)
     this.setStanding(standing)
     this.sync()
   }
@@ -161,7 +218,8 @@ export class Ragdoll {
       .setTranslation(position.x, position.y, position.z)
       .setLinearDamping(0.2).setAngularDamping(1.4).setCcdEnabled(true)
       .setAdditionalSolverIterations(1))
-    this.world.createCollider(collider.setMass(mass).setFriction(0.8).setRestitution(0), body)
+    this.world.createCollider(collider.setMass(mass).setFriction(0.8).setRestitution(0)
+      .setCollisionGroups(BODY_GROUPS).setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.ALL), body)
     const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.03 }))
     mesh.name = label
     mesh.userData.partId = id
@@ -172,93 +230,18 @@ export class Ragdoll {
       body, mesh, label,
       previousPosition: position.clone(),
       previousRotation: new THREE.Quaternion(),
+      previousVelocity: new THREE.Vector3(),
       inertia: Math.min(moments.x, moments.y, moments.z),
+      targetPosition: position.clone(), targetRotation: new THREE.Quaternion(),
     }
     this.parts.set(id, part)
+    this.ownBodies.add(body.handle)
     this.meshes.push(mesh)
     return part
   }
 
   private local(part: Part, point: THREE.Vector3) {
     return point.clone().sub(part.body.translation()).applyQuaternion(new THREE.Quaternion().copy(part.body.rotation()).invert())
-  }
-
-  private addHeroDetails() {
-    const armor = new THREE.MeshStandardMaterial({ color: '#252d38', roughness: 0.48, metalness: 0.3 })
-    const black = new THREE.MeshStandardMaterial({ color: '#080b10', roughness: 0.65, metalness: 0.12 })
-    const gold = new THREE.MeshStandardMaterial({ color: '#a58b48', roughness: 0.48, metalness: 0.55 })
-    const add = (id: string, geometry: THREE.BufferGeometry, material: THREE.Material, x: number, y: number, z: number) => {
-      const mesh = new THREE.Mesh(geometry, material)
-      mesh.position.set(x, y, z)
-      mesh.receiveShadow = true
-      this.parts.get(id)!.mesh.add(mesh)
-      return mesh
-    }
-    const head = this.parts.get('head')!
-    const earGeometry = new THREE.ConeGeometry(0.045, 0.2, 4)
-    for (const sign of [-1, 1]) {
-      const ear = add('head', earGeometry, head.mesh.material, sign * 0.12, 0.19, -0.02)
-      ear.rotation.z = -sign * 0.07
-      ear.castShadow = true
-      // The cowl's ears collide as part of the existing head body.
-      this.world.createCollider(RAPIER.ColliderDesc.cone(0.1, 0.045)
-        .setTranslation(ear.position.x, ear.position.y, ear.position.z).setRotation(ear.quaternion).setMass(0), head.body)
-    }
-    const jaw = new THREE.MeshStandardMaterial({ color: '#b58d72', roughness: 0.85 })
-    add('head', new THREE.SphereGeometry(0.193, 20, 10, Math.PI * 0.31, Math.PI * 0.38, Math.PI * 0.56, Math.PI * 0.28), jaw, 0, 0, 0)
-    const eyes = new THREE.BufferGeometry()
-    const eyePositions: number[] = []
-    for (const sign of [-1, 1]) {
-      for (const [across, height] of [[0.112, 0.048], [0.027, 0.029], [0.040, 0.007], [0.100, 0.018]]) {
-        eyePositions.push(sign * across, height, Math.sqrt(0.199 ** 2 - across ** 2 - height ** 2))
-      }
-    }
-    eyes.setAttribute('position', new THREE.Float32BufferAttribute(eyePositions, 3))
-    eyes.setIndex([0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6])
-    eyes.computeVertexNormals()
-    add('head', eyes, new THREE.MeshStandardMaterial({ color: '#f1f8ff', emissive: '#c8e4ff', emissiveIntensity: 0.65, side: THREE.DoubleSide }), 0, 0, 0)
-    const nose = add('head', new THREE.ConeGeometry(0.028, 0.07, 4), black, 0, -0.004, 0.185)
-    nose.rotation.x = Math.PI / 2
-    add('head', new THREE.BoxGeometry(0.055, 0.007, 0.008), black, 0, -0.10, 0.169)
-
-    const pectoral = new RoundedBoxGeometry(0.25, 0.13, 0.035, 2, 0.02)
-    for (const sign of [-1, 1]) {
-      add('chest', pectoral, armor, sign * 0.135, 0.055, 0.179).rotation.z = -sign * 0.05
-    }
-    add('chest', new RoundedBoxGeometry(0.52, 0.30, 0.035, 2, 0.025), armor, 0, 0.03, -0.1775)
-    const badge = add('chest', new THREE.CircleGeometry(0.16, 40), gold, 0, 0.035, 0.221)
-    badge.scale.y = 0.42
-    const bat = new THREE.Shape()
-    const outline = [
-      [-0.137, 0.018], [-0.095, 0.027], [-0.064, 0.043], [-0.038, 0.030], [-0.018, 0.037],
-      [-0.015, 0.060], [0, 0.040], [0.015, 0.060], [0.018, 0.037], [0.038, 0.030],
-      [0.064, 0.043], [0.095, 0.027], [0.137, 0.018], [0.107, -0.025], [0.080, -0.005],
-      [0.057, -0.040], [0.037, -0.018], [0, -0.055], [-0.037, -0.018], [-0.057, -0.040],
-      [-0.080, -0.005], [-0.107, -0.025],
-    ]
-    outline.forEach(([x, y], index) => index ? bat.lineTo(x, y) : bat.moveTo(x, y))
-    bat.closePath()
-    add('chest', new THREE.ShapeGeometry(bat), black, 0, 0.035, 0.224)
-    const abdominalPlate = new RoundedBoxGeometry(0.33, 0.043, 0.028, 2, 0.013)
-    for (const y of [-0.07, 0, 0.07]) add('abdomen', abdominalPlate, armor, 0, y, 0.14)
-    add('pelvis', new RoundedBoxGeometry(0.56, 0.075, 0.34, 2, 0.015), gold, 0, 0.11, 0)
-    add('pelvis', new RoundedBoxGeometry(0.095, 0.085, 0.025, 2, 0.008), gold, 0, 0.11, 0.19)
-    const pouch = new RoundedBoxGeometry(0.065, 0.09, 0.035, 2, 0.01)
-    for (const sign of [-1, 1]) add('pelvis', pouch, gold, sign * 0.18, 0.105, 0.185)
-
-    const fin = new THREE.Shape().moveTo(0, 0.04).lineTo(0.11, -0.01).lineTo(0, -0.045)
-    fin.closePath()
-    const finGeometry = new THREE.ExtrudeGeometry(fin, { depth: 0.03, bevelEnabled: false })
-    const shinGuard = new RoundedBoxGeometry(0.13, 0.24, 0.035, 2, 0.015)
-    const shoulderCap = new THREE.SphereGeometry(0.12, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.6)
-    for (const sign of [-1, 1]) {
-      const side = sign === -1 ? 'right' : 'left'
-      add(`${side}Shoulder`, shoulderCap, armor, 0, 0, 0)
-      add(`${side}Shin`, shinGuard, armor, 0, 0, 0.078)
-      for (let i = 0; i < 3; i++) {
-        add(`${side}Forearm`, finGeometry, black, sign * 0.07, 0.08 - i * 0.075, -0.015).scale.x = sign
-      }
-    }
   }
 
   private spherical(parent: Part, child: Part, point: THREE.Vector3, limits: AngularJoint['limits'], stiffness: number) {
@@ -274,6 +257,7 @@ export class Ragdoll {
       motor.configureMotorPosition(axis, 0, stiffness, 2 * Math.sqrt(stiffness * inertia))
       motor.setMotorMaxForce(axis, 45)
     }
+    this.poseLinks.push({ parent, child, anchor1: this.local(parent, point), anchor2: this.local(child, point) })
     const record = { parent, child, limits, inertia, motor, stiffness }
     this.angularJoints.push(record)
     this.ballMotors.set(child.mesh.userData.partId, record)
@@ -286,44 +270,338 @@ export class Ragdoll {
     joint.setLimits(min, max)
     joint.configureMotorPosition(0, 3, 1.2)
     joint.setMotorMaxForce(6)
+    this.poseLinks.push({ parent, child, anchor1: this.local(parent, point), anchor2: this.local(child, point), axis })
     this.hinges.set(child.mesh.userData.partId, joint)
+    this.hingeLimits.set(child.mesh.userData.partId, [min, max])
   }
 
-  setMovement(x: number, z: number, running: boolean, sitting: boolean) {
-    this.direction.set(x, 0, z).clampLength(0, 1)
+  setMovement(x: number, z: number, running: boolean, sitting: boolean, y = 0) {
+    if (this.released || this.recovery) return
+    this.direction.set(x, y, z).clampLength(0, 1)
     this.running = running
-    if (sitting !== this.sitting) this.standHeight = STAND_HEIGHT
+    if (sitting !== this.sitting) this.standHeight = this.groundHeight + STAND_HEIGHT - .04
     this.sitting = sitting
   }
 
+  setFlight(held: boolean, pitch: number, bank: number, groundHeight: number, descending = false) {
+    const controlled = this.standing && !this.released && !this.recovery
+    this.ascentHeld = held && controlled
+    this.descending = descending && controlled
+    // Taking off latches flight; releasing Space holds altitude until C is held.
+    this.flightHeld = controlled && (held || (this.airborne && !this.falling)) && !this.descending
+    this.flightPitch = pitch
+    this.flightBank = bank
+    this.groundHeight = groundHeight
+    if (this.ascentHeld && !this.airborne) {
+      this.airborne = true
+      this.flightAge = 0
+      this.flightBoost = 0
+      this.verticalVelocity = 0
+      this.animation.resetFeet()
+      this.sitting = false
+      this.sitBlend = 0
+      this.seatVisible = this.seat.visible = false
+      this.setSeatCollision(false)
+    }
+    if (this.ascentHeld) this.falling = false
+  }
+
+  setFlightAim(direction: THREE.Vector3, forward: number, aiming = false) {
+    this.viewDirection.copy(direction).normalize()
+    this.flightThrottle = forward
+    this.aiming = aiming
+  }
+
+  get isAirborne() { return this.airborne }
+
+  get viewHeading() { return this.heading }
+
+  get flightState(): 'grounded' | 'flying' | 'landing' | 'released' | 'recovering' {
+    if (this.released) return 'released'
+    if (this.recovery) return 'recovering'
+    return !this.airborne ? 'grounded' : this.flightHeld ? 'flying' : 'landing'
+  }
+
+  get isReleased() { return this.released }
+  get isRecovering() { return this.recovery !== null }
+  get altitude() {
+    return Math.max(0, this.parts.get('pelvis')!.body.translation().y - STAND_HEIGHT)
+  }
+  get speed() {
+    return this.velocity.copy(this.parts.get('pelvis')!.body.linvel()).length()
+  }
+
+  renderFocus(target: THREE.Vector3) {
+    target.copy(this.parts.get('pelvis')!.mesh.position)
+    target.y += .17
+    return target
+  }
+
   controlFocus(target: THREE.Vector3) {
-    return target.set(this.supportTarget.x, 1.4 - this.sitBlend * 0.45, this.supportTarget.z)
+    if (this.released || this.recovery) {
+      target.copy(this.parts.get('pelvis')!.body.translation())
+      target.y += .17
+      return target
+    }
+    return target.set(this.supportTarget.x, this.supportTarget.y + .17 - this.sitBlend * .45, this.supportTarget.z)
+  }
+
+  release() {
+    if (this.released) return
+    this.recovery = null
+    this.setStanding(false)
+    this.released = true
+    this.configurePose(false)
+    this.direction.set(0, 0, 0)
+    this.sitting = false
+    this.sitBlend = 0
+    this.seatVisible = this.seat.visible = false
+    this.setSeatCollision(false)
+    // Keep the current momentum, but remove any remaining balance torque immediately.
+    this.parts.forEach(({ body }) => body.resetTorques(true))
+  }
+
+  regainControl() {
+    if (!this.released) return
+    const pelvis = this.parts.get('pelvis')!.body
+    const chest = this.parts.get('chest')!.body
+    const position = pelvis.translation()
+    const momentum = this.velocity.copy(pelvis.linvel()).clone()
+    const rotation = new THREE.Quaternion().copy(chest.rotation())
+    const forward = v(0, 0, 1).applyQuaternion(rotation)
+    const side = v(1, 0, 0).applyQuaternion(rotation)
+    let distance = Infinity
+    // Ignore downward exits when a fallen body overlaps a car or another obstacle.
+    this.world.intersectionsWithRay(
+      new RAPIER.Ray(v(position.x, position.y + .1, position.z), v(0, -1, 0)), 500, false,
+      hit => {
+        if (hit.normal.y > .65) distance = Math.min(distance, hit.timeOfImpact)
+        return true
+      }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, this.isGroundCollider)
+    const ground = Number.isFinite(distance) ? position.y + .1 - distance : this.groundHeight
+    this.groundHeight = ground
+    const grounded = Number.isFinite(distance) && position.y - ground < 1.6
+    if (Math.hypot(forward.x, forward.z) > .3) this.heading = Math.atan2(forward.x, forward.z)
+    const style: GetUpStyle = Math.abs(side.y) > Math.abs(forward.y)
+      ? (side.y < 0 ? 'left' : 'right') : (forward.y < 0 ? 'front' : 'back')
+    this.released = false
+    this.setStanding(true, true)
+    if (grounded) {
+      this.recovery = { style, age: 0, duration: style === 'back' ? 3 : 2.6,
+        height: position.y, rotation }
+      this.torsoTarget.copy(rotation)
+    } else {
+      // Catch the body where it is, preserving travel and altitude in midair.
+      this.airborne = true
+      this.flightAge = 1
+      this.moveVelocity.copy(momentum).setY(0)
+      this.verticalVelocity = momentum.y
+      this.torsoTarget.copy(rotation)
+    }
+  }
+
+  private updateRecovery(dt: number) {
+    const recovery = this.recovery!
+    recovery.age += dt
+    const t = Math.min(1, recovery.age / recovery.duration)
+    this.animation.getUp(recovery.style, t)
+    this.flightEuler.set(this.animation.pitch, this.heading, this.animation.roll, 'YXZ')
+    this.flightRotation.setFromEuler(this.flightEuler)
+    // Begin at the actual fallen orientation and height, then brace, kneel and rise.
+    const engage = THREE.MathUtils.smoothstep(t, 0, .22)
+    this.torsoTarget.copy(recovery.rotation).slerp(this.flightRotation, engage)
+    this.supportTarget.y = THREE.MathUtils.lerp(recovery.height, this.groundHeight + this.animation.height, engage)
+    this.applyLimbPose('left', this.animation.left)
+    this.applyLimbPose('right', this.animation.right)
+    this.applyHeadPose()
+    if (t === 1) {
+      this.recovery = null
+      this.standHeight = this.groundHeight + STAND_HEIGHT - .04
+      this.animation.resetFeet()
+    }
+  }
+
+  private updateFlight(dt: number) {
+    this.flightAge += dt
+    if (Math.hypot(this.viewDirection.x, this.viewDirection.z) > .001) {
+      const heading = Math.atan2(this.viewDirection.x, this.viewDirection.z)
+      const turn = Math.atan2(Math.sin(heading - this.heading), Math.cos(heading - this.heading))
+      const rotation = THREE.MathUtils.clamp(turn, -7 * dt, 7 * dt)
+      this.heading += rotation
+      this.turnRate = THREE.MathUtils.damp(this.turnRate, rotation / dt, 6, dt)
+    } else this.turnRate = THREE.MathUtils.damp(this.turnRate, 0, 6, dt)
+    const boosting = this.running && this.flightThrottle > 0
+    this.flightBoost = THREE.MathUtils.clamp(this.flightBoost
+      + dt * (boosting ? 1 / FLIGHT_BOOST_DURATION : -1 / FLIGHT_BOOST_RELEASE_DURATION), 0, 1)
+    // Ease in and out of acceleration instead of jumping straight to the 10x target.
+    const speed = this.falling ? (this.running ? RUN_SPEED : 2.4)
+      : 11 * THREE.MathUtils.lerp(1, 10, THREE.MathUtils.smootherstep(this.flightBoost, 0, 1))
+    const travel = speed * THREE.MathUtils.smoothstep(this.flightAge, .05, .4)
+    this.position.copy(this.direction).setY(0).multiplyScalar(travel)
+    this.moveVelocity.lerp(this.position, 1 - Math.exp(-8 * dt))
+    this.supportTarget.addScaledVector(this.moveVelocity, dt)
+    this.groundHeight = this.groundBelow(this.supportTarget, this.supportTarget.y + .1)
+    const landing = this.groundHeight + STAND_HEIGHT - .04
+    const clearance = Math.max(0, this.supportTarget.y - landing)
+    const launch = this.flightHeld ? Math.sin(Math.PI * THREE.MathUtils.clamp(this.flightAge / .65, 0, 1)) : 0
+    const vertical = this.direction.y * travel + (this.ascentHeld ? 6 : 0) - (this.descending ? 6 : 0)
+      + (this.flightAge < .3 && !this.descending ? 3 : 0)
+    // No gravity or residual vertical drift in controlled hover.
+    this.verticalVelocity = this.falling ? this.verticalVelocity - 9.8 * dt
+      : vertical === 0 ? 0 : THREE.MathUtils.damp(this.verticalVelocity, vertical, 10, dt)
+    this.supportTarget.y = Math.max(landing, Math.min(300, this.supportTarget.y + this.verticalVelocity * dt))
+    const approach = this.descending || this.falling || vertical < 0
+      ? 1 - THREE.MathUtils.smoothstep(clearance, .2, 3.4) : 0
+    const glide = THREE.MathUtils.smoothstep(this.moveVelocity.length(), 1, 9)
+      * THREE.MathUtils.smoothstep(this.flightAge, .25, 1.05) * (1 - approach)
+    this.flightBlend = THREE.MathUtils.damp(this.flightBlend, glide, 5, dt)
+    // Bank follows the actual turn, with a smaller input-driven trim.
+    const bank = THREE.MathUtils.clamp(-this.turnRate * .16 - this.flightBank * .08, -.5, .5) * this.flightBlend
+    this.flightPitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1))
+    this.animation.fly(dt, this.falling ? 0 : this.flightBlend, this.flightPitch, bank, this.verticalVelocity,
+      launch, this.falling ? 1 : approach, this.moveVelocity.length())
+    this.flightEuler.set(this.animation.pitch, this.heading, this.animation.roll, 'YXZ')
+    this.flightRotation.setFromEuler(this.flightEuler)
+    this.torsoTarget.copy(this.flightRotation)
+    this.applyLimbPose('left', this.animation.left)
+    this.applyLimbPose('right', this.animation.right)
+    this.applyHeadPose()
+    if (!this.ascentHeld && this.verticalVelocity <= 0 && this.supportTarget.y <= landing + .01
+      && this.parts.get('pelvis')!.body.translation().y < landing + .22) {
+      this.airborne = false
+      this.falling = false
+      this.flightHeld = false
+      this.flightBoost = 0
+      this.emitImpact(this.contactPoint.set(this.supportTarget.x, this.groundHeight, this.supportTarget.z),
+        THREE.Object3D.DEFAULT_UP, Math.abs(this.verticalVelocity))
+      this.landingImpact = THREE.MathUtils.clamp(-this.verticalVelocity / 4.5, .15, 1)
+      this.verticalVelocity = 0
+      this.animation.resetFeet()
+      this.standHeight = landing
+      this.supportTarget.y = landing
+    }
   }
 
   private configurePose(active: boolean) {
     if (this.poseActive === active) return
     this.poseActive = active
-    for (const side of ['left', 'right']) {
-      for (const [part, stiffness, maxForce] of [['Thigh', 220, 110], ['Ankle', 40, 35], ['Shoulder', 32, 35]] as const) {
-        const joint = this.ballMotors.get(`${side}${part}`)!
-        const gain = active ? stiffness : joint.stiffness
+    this.ballTargets.clear()
+    this.hingeTargets.clear()
+    this.animation.resetFeet()
+    if (!active) {
+      for (const { motor } of this.angularJoints) {
         for (const axis of [RAPIER.JointAxis.AngX, RAPIER.JointAxis.AngY, RAPIER.JointAxis.AngZ]) {
-          joint.motor.configureMotorPosition(axis, 0, gain, 2 * Math.sqrt(gain * joint.inertia))
-          joint.motor.setMotorMaxForce(axis, active ? maxForce : 45)
+          motor.configureMotor(axis, 0, 0, 0, 0)
+          motor.setMotorMaxForce(axis, 0)
         }
       }
-      for (const [part, stiffness, damping, maxForce] of [['Shin', 100, 4, 85], ['Foot', 60, 3, 35], ['Forearm', 24, 3, 20]] as const) {
+      for (const joint of this.hinges.values()) {
+        joint.configureMotor(0, 0, 0, 0)
+        joint.setMotorMaxForce(0)
+      }
+      return
+    }
+    // Restore the passive torso motors as well when enabling the active pose.
+    for (const { motor, stiffness, inertia } of this.angularJoints) {
+      for (const axis of [RAPIER.JointAxis.AngX, RAPIER.JointAxis.AngY, RAPIER.JointAxis.AngZ]) {
+        motor.configureMotorPosition(axis, 0, stiffness, 2 * Math.sqrt(stiffness * inertia))
+        motor.setMotorMaxForce(axis, 45)
+      }
+    }
+    for (const side of ['left', 'right']) {
+      for (const [part, stiffness, maxForce] of [['Thigh', 220, 110], ['Ankle', 40, 35], ['Shoulder', 45, 35], ['Hand', 8, 8]] as const) {
+        const joint = this.ballMotors.get(`${side}${part}`)!
+        for (const axis of [RAPIER.JointAxis.AngX, RAPIER.JointAxis.AngY, RAPIER.JointAxis.AngZ]) {
+          joint.motor.configureMotorPosition(axis, 0, stiffness, 2 * Math.sqrt(stiffness * joint.inertia))
+          joint.motor.setMotorMaxForce(axis, maxForce)
+        }
+      }
+      for (const [part, stiffness, damping, maxForce] of [['Shin', 100, 4, 85], ['Foot', 60, 3, 35], ['Forearm', 24, 3, 20], ['UpperArm', 32, 3, 35]] as const) {
         const joint = this.hinges.get(`${side}${part}`)!
-        joint.configureMotorModel(active ? RAPIER.MotorModel.ForceBased : RAPIER.MotorModel.AccelerationBased)
-        joint.configureMotorPosition(0, active ? stiffness : 3, active ? damping : 1.2)
-        joint.setMotorMaxForce(active ? maxForce : 6)
+        joint.configureMotorModel(RAPIER.MotorModel.ForceBased)
+        joint.configureMotorPosition(0, stiffness, damping)
+        joint.setMotorMaxForce(maxForce)
       }
     }
   }
 
-  private ballPose(id: string, angle: number, stiffness: number) {
+  private ballPose(id: string, angle: number, stiffness: number, yaw = 0, roll = 0) {
     const joint = this.ballMotors.get(id)!
-    joint.motor.configureMotorPosition(RAPIER.JointAxis.AngX, angle, stiffness, 2 * Math.sqrt(stiffness * joint.inertia))
+    let previous = this.ballTargets.get(id)
+    if (!previous) {
+      previous = new THREE.Vector3()
+      this.ballTargets.set(id, previous)
+    }
+    for (let i = 0; i < 3; i++) {
+      const axis = i === 0 ? RAPIER.JointAxis.AngX : i === 1 ? RAPIER.JointAxis.AngY : RAPIER.JointAxis.AngZ
+      const angleTarget = i === 0 ? angle : i === 1 ? yaw : roll
+      const target = THREE.MathUtils.clamp(angleTarget, -joint.limits[i] * .95, joint.limits[i] * .95)
+      const current = previous.getComponent(i)
+      const next = THREE.MathUtils.damp(current, target, this.poseResponse, this.poseDt)
+      joint.motor.configureMotor(axis, next, THREE.MathUtils.clamp((next - current) / this.poseDt, -8, 8),
+        stiffness, 2 * Math.sqrt(stiffness * joint.inertia))
+      previous.setComponent(i, next)
+    }
+  }
+
+  private hingePose(id: string, angle: number, stiffness: number, damping: number) {
+    const limits = this.hingeLimits.get(id)!
+    const current = this.hingeTargets.get(id) ?? 0
+    const target = THREE.MathUtils.clamp(angle, limits[0], limits[1])
+    const next = THREE.MathUtils.damp(current, target, this.poseResponse, this.poseDt)
+    this.hinges.get(id)!.configureMotor(next, THREE.MathUtils.clamp((next - current) / this.poseDt, -8, 8), stiffness, damping)
+    this.hingeTargets.set(id, next)
+  }
+
+  private applyLimbPose(side: 'left' | 'right', pose: LimbPose, sitting = 0) {
+    this.ballPose(`${side}Thigh`, THREE.MathUtils.lerp(pose.hip, -1.45, sitting), 220, 0, pose.hipRoll * (1 - sitting))
+    this.ballPose(`${side}Ankle`, pose.ankle * (1 - sitting), 40, 0, pose.ankleRoll * (1 - sitting))
+    this.ballPose(`${side}Shoulder`, THREE.MathUtils.lerp(pose.shoulder, -.25, sitting), 45, 0, pose.shoulderRoll * (1 - sitting))
+    this.ballPose(`${side}Hand`, pose.wrist * (1 - sitting), 8)
+    this.hingePose(`${side}UpperArm`, THREE.MathUtils.lerp(pose.upperArm, -.12, sitting), 32, 3)
+    this.hingePose(`${side}Shin`, THREE.MathUtils.lerp(pose.knee, 1.5, sitting), 100, 4)
+    this.hingePose(`${side}Foot`, pose.foot * (1 - sitting), 60, 3)
+    this.hingePose(`${side}Forearm`, THREE.MathUtils.lerp(pose.elbow, -.85, sitting), 24, 3)
+  }
+
+  private applyHeadPose() {
+    if (this.airborne || this.aiming) {
+      const pitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1)) - this.animation.pitch
+      const yaw = Math.atan2(this.viewDirection.x, this.viewDirection.z) - this.heading
+      const turn = Math.atan2(Math.sin(yaw), Math.cos(yaw))
+      this.ballPose('neck', pitch * .32, 70, turn * .4)
+      this.ballPose('head', pitch * .68, 50, turn * .6)
+    } else {
+      this.ballPose('neck', this.animation.neck * (1 - this.sitBlend), 70)
+      this.ballPose('head', this.animation.head * (1 - this.sitBlend), 50)
+    }
+  }
+
+  private sampleGround = (position: THREE.Vector3, normal: THREE.Vector3) => {
+    return this.groundBelow(position, this.groundHeight + .55, normal, 1.1)
+  }
+
+  private groundBelow(position: THREE.Vector3, ceiling: number, normal?: THREE.Vector3, distance = 500) {
+    this.groundRay.origin.x = position.x
+    this.groundRay.origin.y = ceiling
+    this.groundRay.origin.z = position.z
+    let nearest = Infinity
+    normal?.set(0, 1, 0)
+    // Ignore downward exits when the ray starts inside a wall or rooftop fixture.
+    this.world.intersectionsWithRay(this.groundRay, distance, false, hit => {
+      if (hit.normal.y > .65 && hit.timeOfImpact < nearest) {
+        nearest = hit.timeOfImpact
+        normal?.copy(hit.normal)
+      }
+      return true
+    }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, this.isGroundCollider)
+    return Number.isFinite(nearest) ? ceiling - nearest : this.groundHeight
+  }
+
+  private isGroundCollider = (collider: RAPIER.Collider) => {
+    if (!((collider.collisionGroups() >>> 16) & 1)) return false
+    const parent = collider.parent()
+    return !parent || (!this.ownBodies.has(parent.handle) && parent.handle !== this.seatBody.handle)
   }
 
   private setSeatCollision(enabled: boolean) {
@@ -333,16 +611,26 @@ export class Ragdoll {
   }
 
   private updatePose(dt: number) {
-    const active = this.standing && !this.grab
+    this.poseDt = dt
+    this.poseResponse = this.falling ? 96 : this.airborne || this.recovery ? 14 : this.running ? 96 : 22
+    const active = this.standing
     this.configurePose(active)
     if (!active) {
       this.moveVelocity.multiplyScalar(Math.exp(-12 * dt))
       return
     }
+    if (this.recovery) {
+      this.updateRecovery(dt)
+      return
+    }
+    if (this.airborne) {
+      this.updateFlight(dt)
+      return
+    }
     if (this.sitting && !this.seatVisible) {
       this.seatVisible = true
       this.moveVelocity.set(0, 0, 0)
-      this.seat.position.set(this.supportTarget.x, 0, this.supportTarget.z)
+      this.seat.position.set(this.supportTarget.x, this.groundHeight - .04, this.supportTarget.z)
       this.seat.quaternion.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, this.heading)
       this.seatBody.setTranslation(this.seat.position, true)
       this.seatBody.setRotation(this.seat.quaternion, true)
@@ -361,56 +649,89 @@ export class Ragdoll {
     }
     const hasDirection = this.direction.lengthSq() > 0.001 && !this.sitting && this.sitBlend < 0.12
     let alignment = 1
-    if (hasDirection) {
-      this.standHeight = STAND_HEIGHT
-      const targetHeading = Math.atan2(this.direction.x, this.direction.z)
+    if (hasDirection || this.aiming) {
+      this.standHeight = this.groundHeight + STAND_HEIGHT - .04
+      const targetHeading = this.aiming ? Math.atan2(this.viewDirection.x, this.viewDirection.z)
+        : Math.atan2(this.direction.x, this.direction.z)
       const difference = Math.atan2(Math.sin(targetHeading - this.heading), Math.cos(targetHeading - this.heading))
-      this.heading += THREE.MathUtils.clamp(difference, -3.8 * dt, 3.8 * dt)
+      const rotation = THREE.MathUtils.clamp(difference, -3.8 * dt, 3.8 * dt)
+      this.heading += rotation
+      this.turnRate = THREE.MathUtils.damp(this.turnRate, rotation / dt, 8, dt)
       alignment = Math.max(0.15, Math.cos(difference))
-    }
-    const speed = this.running ? 1.8 : 0.8
+    } else this.turnRate = THREE.MathUtils.damp(this.turnRate, 0, 8, dt)
+    const speed = this.running ? RUN_SPEED : 2.4
     this.position.copy(this.direction).multiplyScalar(hasDirection ? speed * alignment : 0)
     this.moveVelocity.lerp(this.position, 1 - Math.exp(-8 * dt))
     this.supportTarget.addScaledVector(this.moveVelocity, dt)
-    const movement = THREE.MathUtils.clamp(this.moveVelocity.length() / speed, 0, 1)
-    this.phase += dt * Math.PI * 2 * (this.running ? 2.3 : 1.55) * movement
-    const bob = Math.abs(Math.sin(this.phase)) * movement * (this.running ? 0.045 : 0.02)
-    const lowerBlend = THREE.MathUtils.smoothstep(this.sitBlend, 0.65, 0.98)
-    const poseBlend = THREE.MathUtils.smoothstep(this.sitBlend, 0, 0.70)
-    this.facing.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, this.heading)
-    this.torsoTarget.copy(this.facing).multiply(this.q2.setFromAxisAngle(
-      this.position.set(1, 0, 0), movement * (this.running ? 0.14 : 0.045) + this.sitBlend * 0.04,
-    ))
-    let longestLeg = 0
-    for (const [side, offset] of [['left', 0], ['right', Math.PI]] as const) {
-      const cycle = this.phase + offset
-      const stride = (this.running ? 0.8 : 0.52) * movement * (1 - poseBlend)
-      const hip = THREE.MathUtils.lerp(-Math.sin(cycle) * stride, -1.45, poseBlend)
-      const knee = THREE.MathUtils.lerp(0.035 + movement * (0.10 + Math.max(0, Math.cos(cycle)) * (this.running ? 1.1 : 0.65)), 1.5, poseBlend)
-      const ankle = THREE.MathUtils.clamp(-(hip + knee) * 0.3, -0.28, 0.28)
-      const foot = THREE.MathUtils.clamp(-(hip + knee) - ankle, -0.6, 0.7)
-      longestLeg = Math.max(longestLeg, 0.455 * Math.cos(hip) + 0.45 * Math.cos(hip + knee))
-      this.ballPose(`${side}Thigh`, hip, 220)
-      this.ballPose(`${side}Ankle`, ankle, 40)
-      this.ballPose(`${side}Shoulder`, Math.sin(cycle) * stride * 0.65 - this.sitBlend * 0.25, 32)
-      this.hinges.get(`${side}Shin`)!.configureMotorPosition(knee, 100, 4)
-      this.hinges.get(`${side}Foot`)!.configureMotorPosition(foot, 60, 3)
-      this.hinges.get(`${side}Forearm`)!.configureMotorPosition(
-        -THREE.MathUtils.lerp(0.15 + movement * (this.running ? 0.6 : 0.15), 0.85, this.sitBlend), 24, 3,
-      )
+    // Sample at the new position every physics step, including while idle.
+    this.groundHeight = this.groundBelow(this.supportTarget, this.supportTarget.y - .6)
+    // Retain support while a planted sole still overlaps the ledge. Starting the
+    // fall at the pelvis center can drag a trailing boot through the roof edge.
+    for (const [index, side] of ['left', 'right'].entries()) {
+      if (this.animation.feet[index].swinging) continue
+      const foot = this.parts.get(`${side}Foot`)!.body
+      this.q1.copy(foot.rotation())
+      for (const x of [-.1, .1]) for (const z of [-.205, .205]) {
+        this.position.set(x, 0, z).applyQuaternion(this.q1).add(foot.translation())
+        const height = this.groundBelow(this.position, this.supportTarget.y - .6)
+        if (Math.abs(this.supportTarget.y - (height + STAND_HEIGHT - .04)) < .55) {
+          this.groundHeight = Math.max(this.groundHeight, height)
+        }
+      }
     }
-    // Lower the pelvis as the stance leg bends, keeping walking feet near the ground.
-    const legDrop = (0.905 - longestLeg) * movement * (1 - poseBlend) * (this.running ? 0.65 : 1)
-    const stanceLowering = 0.075 * movement * (1 - poseBlend)
-    const height = THREE.MathUtils.lerp(this.standHeight - legDrop - stanceLowering + bob, 0.72, lowerBlend)
+    this.standHeight = this.groundHeight + STAND_HEIGHT - .04
+    if (this.supportTarget.y - this.standHeight > .55 && this.sitBlend < .12) {
+      this.airborne = this.falling = true
+      this.flightHeld = false
+      this.flightAge = 1
+      this.verticalVelocity = 0
+      this.animation.resetFeet()
+      return
+    }
+    // Keep both legs within reach when straddling a ridge or a side slope.
+    let support = this.groundHeight
+    for (const side of [-1, 1]) {
+      this.position.set(side * .225 * Math.cos(this.heading), 0, -side * .225 * Math.sin(this.heading))
+        .add(this.supportTarget)
+      const height = this.sampleGround(this.position, this.contactNormal)
+      if (this.groundHeight - height < .45) support = Math.min(support, height)
+    }
+    this.standHeight = support + STAND_HEIGHT - .04
+    const pelvis = this.parts.get('pelvis')!.body
+    this.pelvisPosition.copy(pelvis.translation())
+    this.pelvisRotation.copy(pelvis.rotation())
+    this.measuredVelocity.copy(this.moveVelocity)
+    if (this.sitBlend > .12) this.measuredVelocity.set(0, 0, 0)
+    this.landingImpact = THREE.MathUtils.damp(this.landingImpact, 0, 7, dt)
+    this.animation.walk(dt, this.pelvisPosition, this.pelvisRotation, this.heading,
+      this.measuredVelocity, this.running, this.turnRate, this.landingImpact, this.sampleGround, this.footContacts)
+    const lowerBlend = THREE.MathUtils.smoothstep(this.sitBlend, .65, .98)
+    const poseBlend = THREE.MathUtils.smoothstep(this.sitBlend, 0, .70)
+    this.flightEuler.set(THREE.MathUtils.lerp(this.animation.pitch, .04, poseBlend), this.heading,
+      this.animation.roll * (1 - poseBlend), 'YXZ')
+    this.torsoTarget.setFromEuler(this.flightEuler)
+    this.applyLimbPose('left', this.animation.left, poseBlend)
+    this.applyLimbPose('right', this.animation.right, poseBlend)
+    this.applyHeadPose()
+    const height = THREE.MathUtils.lerp(this.standHeight + this.animation.height, this.groundHeight + .68, lowerBlend)
     this.supportTarget.y = THREE.MathUtils.damp(this.supportTarget.y, height, 8, dt)
   }
 
-  setStanding(enabled: boolean) {
+  setStanding(enabled: boolean, preserveHeight = false) {
+    if (this.released && enabled) return
     if (enabled === this.standing) return
     this.standing = enabled
-    this.supportJoints.forEach((joint) => this.world.removeImpulseJoint(joint, true))
-    this.supportJoints = []
+    this.protection = this.protectionHold = this.protectionSide = 0
+    this.airborne = this.falling = this.flightHeld = this.ascentHeld = this.descending = false
+    this.flightBlend = this.verticalVelocity = this.landingImpact = this.turnRate = 0
+    this.flightBoost = 0
+    this.moveVelocity.set(0, 0, 0)
+    this.animation.resetFeet()
+    this.parts.forEach(({ body }) => {
+      body.setBodyType(enabled ? RAPIER.RigidBodyType.KinematicPositionBased : RAPIER.RigidBodyType.Dynamic, true)
+      body.resetForces(false)
+      body.resetTorques(false)
+    })
     if (enabled) {
       this.seatVisible = false
       this.seat.visible = false
@@ -418,65 +739,293 @@ export class Ragdoll {
       const pelvis = this.parts.get('pelvis')!
       // Re-enable at the current location without teleporting a fallen body.
       this.supportTarget.copy(pelvis.body.translation())
-      this.supportTarget.y = STAND_HEIGHT
-      this.support.setTranslation(this.supportTarget, true)
-      this.supportJoints.push(this.world.createImpulseJoint(
-        RAPIER.JointData.spring(0, 3500, 350, origin, origin), this.support, pelvis.body, true))
-      this.supportJoints.push(this.world.createImpulseJoint(
-        RAPIER.JointData.spring(0, 2500, 250, v(0, 0.55, 0), origin), this.support, this.parts.get('chest')!.body, true))
+      this.standHeight = this.groundHeight + STAND_HEIGHT - .04
+      if (!preserveHeight) this.supportTarget.y = this.standHeight
     }
     this.parts.forEach(({ body }) => body.wakeUp())
   }
 
-  partFor(object: THREE.Object3D): Part | undefined {
-    let current: THREE.Object3D | null = object
-    while (current) {
-      if (current.userData.partId) return this.parts.get(current.userData.partId)
-      current = current.parent
+  private createCapeBodies() {
+    for (const [id, { body }] of this.parts) {
+      const position = body.translation()
+      const proxy = this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased()
+        .setTranslation(position.x, position.y, position.z))
+      this.ownBodies.add(proxy.handle)
+      this.capeBodies.set(id, proxy)
+      for (let i = 0; i < body.numColliders(); i++) {
+        const collider = body.collider(i)
+        const local = collider.translationWrtParent()!
+        this.world.createCollider(new RAPIER.ColliderDesc(collider.shape)
+          .setTranslation(local.x, local.y, local.z)
+          .setRotation(collider.rotationWrtParent()!).setFriction(.8).setMass(0)
+          .setCollisionGroups(id.endsWith('Shoulder') ? COLLAR_PROXY_GROUPS : CAPE_PROXY_GROUPS), proxy)
+      }
     }
   }
 
-  highlight(part?: Part) {
-    if (this.highlighted === part) return
-    this.highlighted?.mesh.material.emissive.setHex(0)
-    this.highlighted = part ?? null
-    part?.mesh.material.emissive.setHex(0x172c50)
+  private animateBodies() {
+    const pelvis = this.parts.get('pelvis')!
+    pelvis.targetPosition.copy(this.supportTarget)
+    this.q1.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, -this.animation.twist)
+    pelvis.targetRotation.copy(this.torsoTarget).multiply(this.q1)
+    // Links are constructed from torso to fingertips/toes, in parent-first order.
+    for (const link of this.poseLinks) this.animateLink(link)
+    if (!this.airborne && !this.recovery && this.sitBlend < .12) this.plantFeet()
   }
 
-  startGrab(part: Part, point: THREE.Vector3) {
-    this.endGrab()
-    const local = this.local(part, point)
-    const handle = this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(point.x, point.y, point.z))
-    this.world.createImpulseJoint(RAPIER.JointData.spring(0, 1800, 100, origin, local), handle, part.body, true)
-    this.grab = { part, local, handle, supportOffset: this.supportTarget.clone().sub(point) }
-    this.grabTarget.copy(point)
-    this.highlight(part)
-    this.marker.visible = this.tether.visible = true
-    this.parts.forEach(({ body }) => body.wakeUp())
+  private animateLink({ parent, child, anchor1, anchor2, axis }: PoseLink) {
+    const id = child.mesh.userData.partId as string
+    if (axis) this.q1.setFromAxisAngle(axis, this.hingeTargets.get(id) ?? 0)
+    else {
+      const angles = this.ballTargets.get(id)
+      this.flightEuler.set(angles?.x ?? 0,
+        (angles?.y ?? 0) + (id === 'abdomen' || id === 'chest' ? this.animation.twist : 0), angles?.z ?? 0, 'XYZ')
+      this.q1.setFromEuler(this.flightEuler)
+    }
+    child.targetRotation.copy(parent.targetRotation).multiply(this.q1)
+    child.targetPosition.copy(anchor1).applyQuaternion(parent.targetRotation).add(parent.targetPosition)
+      .sub(this.position.copy(anchor2).applyQuaternion(child.targetRotation))
   }
 
-  moveGrab(point: THREE.Vector3) {
-    this.grabTarget.copy(point)
-    this.grabTarget.x = THREE.MathUtils.clamp(point.x, -4, 4)
-    this.grabTarget.y = THREE.MathUtils.clamp(point.y, -0.05, 4.5)
-    this.grabTarget.z = THREE.MathUtils.clamp(point.z, -3, 3)
+  private plantFeet() {
+    for (let i = 0; i < this.legChains.length; i++) {
+      if (this.animation.feet[i].swinging) continue
+      const chain = this.legChains[i]
+      const thigh = chain[0].child.mesh.userData.partId as string
+      const shin = chain[1].child.mesh.userData.partId as string
+      const ankle = chain[2].child.mesh.userData.partId as string
+      const foot = chain[3].child
+      const footId = foot.mesh.userData.partId as string
+      const sole = foot.mesh.getObjectByName('boot-sole') as THREE.Mesh
+      const vertices = sole.geometry.getAttribute('position')
+      const hipTarget = this.ballTargets.get(thigh)!
+      const ankleTarget = this.ballTargets.get(ankle)!
+      let hip = hipTarget.x, knee = this.hingeTargets.get(shin) ?? 0
+      const solePitch = hip + knee + ankleTarget.x + (this.hingeTargets.get(footId) ?? 0)
+      const pose = (h: number, k: number) => {
+        hipTarget.x = h
+        this.hingeTargets.set(shin, k)
+        const pitch = solePitch - h - k
+        ankleTarget.x = THREE.MathUtils.clamp(pitch * .35, -.3, .3)
+        this.hingeTargets.set(footId, THREE.MathUtils.clamp(pitch - ankleTarget.x, -.65, .75))
+        for (const link of chain) this.animateLink(link)
+      }
+      // Resolve the final sole against the support plane after torso motion and
+      // joint smoothing. Adjust the leg joints so the whole chain stays connected.
+      for (let iteration = 0; iteration < 10; iteration++) {
+        const height = this.sampleGround(foot.targetPosition, this.contactNormal)
+        const surfaceX = foot.targetPosition.x, surfaceZ = foot.targetPosition.z
+        const clearance = () => {
+          this.inverseRotation.copy(foot.targetRotation).invert()
+          this.rotation.copy(this.contactNormal).applyQuaternion(this.inverseRotation)
+          let minimum = Infinity
+          for (let vertex = 0; vertex < vertices.count; vertex++) {
+            const projection = (vertices.getX(vertex) + sole.position.x) * this.rotation.x
+              + (vertices.getY(vertex) + sole.position.y) * this.rotation.y
+              + (vertices.getZ(vertex) + sole.position.z) * this.rotation.z
+            minimum = Math.min(minimum, projection)
+          }
+          return (minimum + (foot.targetPosition.y - height) * this.contactNormal.y
+            + (foot.targetPosition.x - surfaceX) * this.contactNormal.x
+            + (foot.targetPosition.z - surfaceZ) * this.contactNormal.z) / this.contactNormal.y
+        }
+        const gap = clearance() - .002
+        if (Math.abs(gap) < .003) break
+        pose(hip + .005, knee)
+        const hipGradient = (clearance() - .002 - gap) / .005
+        pose(hip, knee + .005)
+        const kneeGradient = (clearance() - .002 - gap) / .005
+        const correction = -gap / (hipGradient ** 2 + kneeGradient ** 2 + .0001)
+        hip = THREE.MathUtils.clamp(hip + THREE.MathUtils.clamp(correction * hipGradient, -.15, .15), -1.55, 1.55)
+        knee = THREE.MathUtils.clamp(knee + THREE.MathUtils.clamp(correction * kneeGradient, -.15, .15), 0, 2.45)
+        pose(hip, knee)
+      }
+    }
   }
 
-  endGrab() {
-    if (this.grab) this.world.removeRigidBody(this.grab.handle)
-    this.grab = null
-    this.highlight()
-    this.marker.visible = this.tether.visible = false
+  private isSupportContact(normal: RAPIER.Vector) {
+    // Ordinary foot support and a controlled landing must not count as crashes.
+    return normal.y > .65 && (!this.airborne || !this.flightHeld || this.flightAge < .3
+      || (!this.ascentHeld && this.verticalVelocity <= 0))
   }
 
-  step(dt: number) {
-    // Forces persist in Rapier. Clear last step's joint torques before applying PD springs.
-    this.parts.forEach(({ body, previousPosition, previousRotation }) => {
-      previousPosition.copy(body.translation())
-      previousRotation.copy(body.rotation())
-      body.resetTorques(false)
-    })
-    this.updatePose(dt)
+  private isFootSupport(surface: RAPIER.Collider, foot: RAPIER.Collider) {
+    const position = foot.translation()
+    if (position.y > this.groundHeight + .45) return false
+    this.groundRay.origin.x = position.x
+    this.groundRay.origin.y = position.y + .1
+    this.groundRay.origin.z = position.z
+    const hit = surface.castRayAndGetNormal(this.groundRay, .65, true)
+    return !!hit && this.isSupportContact(hit.normal)
+      && Math.abs(this.groundRay.origin.y - hit.timeOfImpact - this.groundHeight) < .08
+  }
+
+  private sweepForImpact(dt: number) {
+    for (const [id, { body, targetPosition }] of this.parts) {
+      this.velocity.copy(targetPosition).sub(body.translation()).divideScalar(dt)
+      if (this.velocity.lengthSq() < 1e-6) continue
+      for (let i = 0; i < body.numColliders(); i++) {
+        const collider = body.collider(i)
+        const hit = this.world.castShape(collider.translation(), collider.rotation(), this.velocity,
+          collider.shape, 0, dt, false, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS,
+          undefined, undefined, undefined, other => {
+            if (!this.isGroundCollider(other)) return false
+            if (id.endsWith('Foot') && this.isFootSupport(other, collider)) return false
+            // An initially penetrating sole can give a degenerate sweep normal.
+            // Use its existing contact normal to exclude ordinary support first.
+            const contact = other.contactCollider(collider, .01)
+            return !contact || !this.isSupportContact(contact.normal1)
+          })
+        if (hit && !this.isSupportContact(hit.normal1)) {
+          this.contactNormal.copy(hit.normal1)
+          this.impactVelocity.copy(this.velocity)
+          const obstacle = hit.collider.parent()
+          if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(hit.witness1))
+          this.emitImpact(hit.witness1, hit.normal1, Math.max(0, -this.impactVelocity.dot(this.contactNormal)))
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  // Run after world.step as well: a moving car can hit an idle character.
+  checkForImpact() {
+    const canRelease = this.standing && !this.released && !this.recovery
+    let impact = false
+    let strongest = 0
+    this.supported = false
+    for (const [id, { body, previousVelocity }] of this.parts) {
+      for (let i = 0; i < body.numColliders(); i++) {
+        const collider = body.collider(i)
+        this.world.contactPairsWith(collider, other => {
+          if (!this.isGroundCollider(other)) return
+          const footSupport = id.endsWith('Foot') && this.isFootSupport(other, collider)
+          this.world.contactPair(collider, other, (manifold, flipped) => {
+            this.contactNormal.copy(manifold.normal()).multiplyScalar(flipped ? 1 : -1)
+            for (let j = 0; j < manifold.numContacts(); j++) {
+              if (manifold.contactDist(j) > .01) continue
+              if (this.contactNormal.y > .5) this.supported = true
+              if (canRelease && !footSupport && !this.isSupportContact(this.contactNormal)
+                && manifold.contactDist(j) <= .001) impact = true
+              const local = flipped ? manifold.localContactPoint2(j) : manifold.localContactPoint1(j)
+              if (!local) continue
+              this.contactPoint.copy(local).applyQuaternion(this.q1.copy(collider.rotation())).add(collider.translation())
+              this.impactVelocity.copy(previousVelocity)
+              const obstacle = other.parent()
+              if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(this.contactPoint))
+              const speed = Math.max(0, -this.impactVelocity.dot(this.contactNormal))
+              if (speed > strongest) {
+                strongest = speed
+                this.impactPoint.copy(this.contactPoint)
+                this.impactNormal.copy(this.contactNormal)
+              }
+            }
+          })
+        })
+      }
+    }
+    if (canRelease && impact) this.release()
+    if (strongest >= 1.4) {
+      if (!this.standing) this.braceForImpact(this.impactNormal, strongest)
+      this.emitImpact(this.impactPoint, this.impactNormal, strongest)
+    } else if (canRelease && impact) this.protectionHold = .45
+  }
+
+  private braceForImpact(normal: THREE.Vector3Like, speed: number) {
+    this.protectionHold = Math.max(this.protectionHold, THREE.MathUtils.clamp(speed * .045, .3, .85))
+    // The normal points away from the obstacle. Choose the exposed side in the
+    // chest's frame; this works while tumbling and for impacts from moving cars.
+    this.inverseRotation.copy(this.parts.get('chest')!.body.rotation()).invert()
+    this.contactNormal.copy(normal).negate().applyQuaternion(this.inverseRotation)
+    this.protectionSide = THREE.MathUtils.clamp(this.contactNormal.x * 1.6, -1, 1)
+  }
+
+  private updateProtection(dt: number) {
+    const pelvis = this.parts.get('pelvis')!.body
+    this.protectionHold = Math.max(0, this.protectionHold - dt)
+    const speed = this.velocity.copy(pelvis.linvel()).length()
+    // Anticipate a surface for a quarter second along the actual trajectory.
+    // Ignore body/cape copies and sensors, just as the collision release does.
+    if (speed > 1.5) {
+      this.protectionRay.origin = this.parts.get('chest')!.body.translation()
+      this.protectionRay.dir = this.velocity.multiplyScalar(1 / speed)
+      const hit = this.world.castRayAndGetNormal(this.protectionRay, speed * .28 + .3, true,
+        RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, this.isGroundCollider)
+      if (hit) this.braceForImpact(hit.normal, speed)
+    }
+    const falling = !this.supported && pelvis.linvel().y < -.8
+    const target = this.protectionHold > 0 ? 1 : falling ? .72 : 0
+    this.protection = THREE.MathUtils.damp(this.protection, target, target > this.protection ? 13 : 3.2, dt)
+    const strength = this.protection < .015 ? 0 : this.protection
+    const musclePower = strength * PROTECTION_POWER
+    // Finite joint torques only: never balance, teleport or brake the root.
+    // Opposing muscle forces preserve the body's linear impact momentum.
+    const ball = (id: string, x: number, y: number, z: number, spring: number, maxForce: number) => {
+      const joint = this.ballMotors.get(id)!
+      const angles = [x, y, z]
+      for (let i = 0; i < 3; i++) {
+        angles[i] = THREE.MathUtils.clamp(angles[i], -joint.limits[i] * .9, joint.limits[i] * .9)
+      }
+      // A single quaternion spring avoids competing Euler-axis motors at the
+      // large shoulder angles needed to bring the fists beside the temples.
+      this.flightEuler.set(angles[0], angles[1], angles[2], 'XYZ')
+      this.q1.copy(joint.parent.body.rotation())
+      this.q2.setFromEuler(this.flightEuler).premultiply(this.q1)
+      this.inverseRotation.copy(joint.child.body.rotation()).invert()
+      this.q2.multiply(this.inverseRotation).normalize()
+      if (this.q2.w < 0) this.q2.set(-this.q2.x, -this.q2.y, -this.q2.z, -this.q2.w)
+      const sine = Math.hypot(this.q2.x, this.q2.y, this.q2.z)
+      const angle = sine > 1e-6 ? 2 * Math.atan2(sine, this.q2.w) / sine : 2
+      this.rotation.set(this.q2.x, this.q2.y, this.q2.z).multiplyScalar(angle)
+      const stiffness = spring * musclePower
+      const damping = 2 * Math.sqrt(stiffness * joint.inertia)
+      this.velocity.copy(joint.child.body.angvel()).sub(this.position.copy(joint.parent.body.angvel()))
+      this.torque.copy(this.rotation).multiplyScalar(stiffness).addScaledVector(this.velocity, -damping)
+        .divideScalar(1 + damping * dt / joint.inertia + stiffness * dt * dt / joint.inertia)
+        .clampLength(0, maxForce * musclePower)
+      if (strength) {
+        joint.child.body.addTorque(this.torque, true)
+        joint.parent.body.addTorque(this.torque.multiplyScalar(-1), true)
+      }
+    }
+    const hinge = (id: string, angle: number, spring: number, maxForce: number) => {
+      const joint = this.hinges.get(id)!
+      const limits = this.hingeLimits.get(id)!
+      joint.configureMotorModel(RAPIER.MotorModel.ForceBased)
+      joint.configureMotorPosition(THREE.MathUtils.clamp(angle, limits[0], limits[1]), spring * musclePower,
+        1.6 * strength * Math.sqrt(PROTECTION_POWER))
+      joint.setMotorMaxForce(maxForce * musclePower)
+    }
+    ball('abdomen', .20, 0, -.05 * this.protectionSide, 34, 12)
+    ball('chest', .16, 0, -.08 * this.protectionSide, 38, 14)
+    ball('neck', .16, 0, 0, 18, 5)
+    ball('head', .32, -.12 * this.protectionSide, 0, 20, 5)
+    for (const sign of [-1, 1]) {
+      const side = sign < 0 ? 'right' : 'left'
+      const exposed = .5 + .5 * sign * this.protectionSide
+      // Forearms shield the temples and jaw; elbows close over the ribs.
+      ball(`${side}Shoulder`, -1.70 - .20 * exposed, -sign * .80, -sign * .85, 48, 16)
+      hinge(`${side}UpperArm`, -.28, 26, 10)
+      hinge(`${side}Forearm`, -2.35 + .10 * exposed, 28, 10)
+      ball(`${side}Hand`, -.12, 0, 0, 5, 2)
+      ball(`${side}Thigh`, -.48 - .15 * exposed, 0, sign * .10, 34, 15)
+      hinge(`${side}Shin`, 1.05 + .2 * exposed, 30, 13)
+      ball(`${side}Ankle`, .06, 0, 0, 6, 3)
+      hinge(`${side}Foot`, -.12, 8, 3)
+    }
+  }
+
+  private emitImpact(point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) {
+    if (speed < 1.4) return
+    // Several limbs can hit the same patch in one collision; emit one cloud there.
+    if (this.impactTime - this.lastImpactTime < .16 && this.lastImpactPosition.distanceToSquared(point) < 2.25) return
+    this.lastImpactTime = this.impactTime
+    this.lastImpactPosition.copy(point)
+    this.onImpact(point, normal, speed)
+  }
+
+  private enforceJointLimits(dt: number) {
     for (const { parent, child, limits, inertia } of this.angularJoints) {
       this.q1.copy(parent.body.rotation())
       this.inverseRotation.copy(this.q1).invert()
@@ -485,16 +1034,13 @@ export class Ragdoll {
       const sine = Math.hypot(this.q2.x, this.q2.y, this.q2.z)
       const scale = sine > 1e-6 ? 2 * Math.atan2(sine, this.q2.w) / sine : 2
       this.rotation.set(this.q2.x, this.q2.y, this.q2.z).multiplyScalar(scale)
-      // The solver handles the normal spring motion. Only calculate extra torques
-      // when a ball joint reaches one of its anatomical stops.
       if (Math.abs(this.rotation.x) <= limits[0] && Math.abs(this.rotation.y) <= limits[1]
         && Math.abs(this.rotation.z) <= limits[2]) continue
-      this.velocity.copy(child.body.angvel()).sub(parent.body.angvel()).applyQuaternion(this.inverseRotation)
+      this.velocity.copy(child.body.angvel()).sub(this.position.copy(parent.body.angvel()))
+        .applyQuaternion(this.inverseRotation)
       for (let axis = 0; axis < 3; axis++) {
         const angle = this.rotation.getComponent(axis)
         const excess = angle - THREE.MathUtils.clamp(angle, -limits[axis], limits[axis])
-        // Soft anatomical stops on ball joints; elbows/knees have solver-enforced hinge limits.
-        // Implicit damping is essential for the low-inertia neck, hands and ankles.
         const spring = excess ? 90 : 0
         const damping = 2 * Math.sqrt(spring * inertia)
         const force = (-spring * excess - damping * this.velocity.getComponent(axis))
@@ -505,33 +1051,53 @@ export class Ragdoll {
       child.body.addTorque(this.torque, true)
       parent.body.addTorque(this.torque.multiplyScalar(-1), true)
     }
+  }
+
+  step(dt: number) {
+    this.impactTime += dt
+    this.parts.forEach(({ body, previousPosition, previousRotation, previousVelocity }) => {
+      previousPosition.copy(body.translation())
+      previousRotation.copy(body.rotation())
+      previousVelocity.copy(body.linvel())
+      body.resetTorques(false)
+      body.resetForces(false)
+    })
+    // Grounded animation uses sampled support; it doesn't depend on solver impulses.
+    this.footContacts.fill(true)
+    this.updatePose(dt)
     if (this.standing) {
-      // Optional torso springs and bounded balance torques help pose the mannequin.
-      // Every visible part remains dynamic, including the pelvis and torso.
-      if (this.grab && this.torso.includes(this.grab.part)) {
-        this.supportTarget.copy(this.grab.handle.translation()).add(this.grab.supportOffset)
-        this.standHeight = this.supportTarget.y
-      }
-      this.support.setNextKinematicTranslation(this.supportTarget)
-      for (const { body, inertia } of this.torso) {
-        this.q1.copy(body.rotation()).invert()
-        this.q2.copy(this.torsoTarget).multiply(this.q1)
-        if (this.q2.w < 0) this.q2.set(-this.q2.x, -this.q2.y, -this.q2.z, -this.q2.w)
-        this.rotation.set(this.q2.x, this.q2.y, this.q2.z).multiplyScalar(2)
-        this.velocity.copy(body.angvel())
-        // Compensate for the larger fixed step so standing assistance stays firm.
-        const spring = 200
-        const damping = 2 * Math.sqrt(spring * inertia)
-        this.torque.copy(this.rotation).multiplyScalar(spring).addScaledVector(this.velocity, -damping)
-          .multiplyScalar(1 / (1 + damping * dt / inertia + spring * dt * dt / inertia)).clampLength(0, 65)
-        body.addTorque(this.torque, true)
+      this.animateBodies()
+      this.parts.forEach(({ body, targetPosition, previousVelocity }) => {
+        previousVelocity.copy(targetPosition).sub(body.translation()).divideScalar(dt)
+      })
+      if (!this.recovery && this.sweepForImpact(dt)) this.release()
+      else {
+        for (const { body, targetPosition, targetRotation } of this.parts.values()) {
+          body.setNextKinematicTranslation(targetPosition)
+          body.setNextKinematicRotation(targetRotation)
+        }
       }
     }
-    if (this.grab) {
-      // Bound the handle speed so a sudden cursor jump cannot launch the body.
-      this.position.copy(this.grabTarget).sub(this.grab.handle.translation()).clampLength(0, 6 * dt)
-        .add(this.grab.handle.translation())
-      this.grab.handle.setNextKinematicTranslation(this.position)
+    if (!this.standing) {
+      this.updateProtection(dt)
+      this.enforceJointLimits(dt)
+    }
+    // Copies are always kinematic: cape contacts and attachment forces can never
+    // feed back into the real body, even during a fall or a collision.
+    for (const [id, proxy] of this.capeBodies) {
+      const { body, targetPosition, targetRotation } = this.parts.get(id)!
+      if (this.standing) {
+        proxy.setNextKinematicTranslation(targetPosition)
+        proxy.setNextKinematicRotation(targetRotation)
+      } else {
+        this.position.copy(body.translation()).addScaledVector(this.velocity.copy(body.linvel()), dt)
+        this.velocity.copy(body.angvel())
+        const speed = this.velocity.length()
+        this.q1.setFromAxisAngle(this.velocity.divideScalar(speed || 1), speed * dt)
+        this.q2.copy(body.rotation()).premultiply(this.q1)
+        proxy.setNextKinematicTranslation(this.position)
+        proxy.setNextKinematicRotation(this.q2)
+      }
     }
   }
 
@@ -540,24 +1106,13 @@ export class Ragdoll {
       mesh.position.lerpVectors(previousPosition, this.position.copy(body.translation()), alpha)
       mesh.quaternion.slerpQuaternions(previousRotation, this.q1.copy(body.rotation()), alpha)
     })
-    if (this.grab) {
-      this.position.copy(this.grab.local).applyQuaternion(this.grab.part.mesh.quaternion)
-        .add(this.grab.part.mesh.position)
-      this.marker.position.copy(this.position)
-      const points = this.tether.geometry.getAttribute('position') as THREE.BufferAttribute
-      points.setXYZ(0, this.position.x, this.position.y, this.position.z)
-      const target = this.grab.handle.translation()
-      points.setXYZ(1, target.x, target.y, target.z)
-      points.needsUpdate = true
-      this.tether.geometry.computeBoundingSphere()
-    }
   }
 
   dispose() {
-    this.endGrab()
+    this.disposeAppearance()
     const geometries = new Set<THREE.BufferGeometry>()
     const materials = new Set<THREE.Material>()
-    for (const object of [...this.meshes, this.marker, this.tether, this.seat]) {
+    for (const object of [...this.meshes, this.seat]) {
       this.scene.remove(object)
       object.traverse((child) => {
         if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
