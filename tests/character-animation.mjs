@@ -220,4 +220,16 @@ for (const style of ['back', 'front', 'left', 'right']) {
     assert(Object.values(flight.right).every(Number.isFinite))
   }
 }
-console.log(JSON.stringify({passed: true, walking: results, running: runningResults, directionalCases: directionalResults.length, flightDirectionCases: flightDirections.length, flight: 'hover, cruise, banks, landing and recovery passed'}, null, 2))
+const breath = new CharacterAnimation()
+const breathPelvis = new THREE.Vector3(0, 1.23, 0)
+for (let i = 0; i < 60; i++) {
+  breath.walk(1 / 60, breathPelvis, rotation, 0, new THREE.Vector3(), false, 0, 0, ground)
+  breath.blow(1 / 60, true)
+}
+assert(breath.blowWeight > .9 && breath.left.elbow < -.7, 'super-breath pose did not engage')
+for (let i = 0; i < 120; i++) {
+  breath.walk(1 / 60, breathPelvis, rotation, 0, new THREE.Vector3(), false, 0, 0, ground)
+  breath.blow(1 / 60, false)
+}
+assert(breath.blowWeight < .02 && Math.abs(breath.left.shoulder) < .02, 'super-breath pose did not recover')
+console.log(JSON.stringify({passed: true, walking: results, running: runningResults, directionalCases: directionalResults.length, flightDirectionCases: flightDirections.length, flight: 'hover, cruise, banks, landing and recovery passed', superBreath: 'engagement and recovery passed'}, null, 2))

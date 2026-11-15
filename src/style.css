@@ -36,6 +36,7 @@
 .secondary-controls { flex-wrap: wrap; max-width: 350px; }
 .power-button { display: flex; align-items: center; justify-content: center; gap: 7px; }
 .power-button.engaged { color: #ffb7ae; border-color: #ff695c !important; background: #5a2525 !important; }
+.power-button.blow-button.engaged { color: #c3efff; border-color: #62c9ff !important; background: #17425a !important; }
 @media (pointer: coarse) {
   .secondary-controls { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
   .secondary-controls .run-button { display: block; }

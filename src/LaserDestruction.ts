@@ -40,6 +40,7 @@ type PreparedCarve = {
 }
 const MELT_TIME = 1.5
 const MAX_BURNS = 256
+const MAX_BREATH_TARGETS = 1
 const DEBRIS_LIFETIME = 30
 const DEBRIS_DISTANCE = 150
 const COLD_STORAGE_DELAY = 8
@@ -71,6 +72,13 @@ export class LaserDestruction {
   private burnMarks: THREE.InstancedMesh<THREE.CircleGeometry, THREE.ShaderMaterial>
   private burnPose = new THREE.Object3D()
   private surfaceAxis = new THREE.Vector3(0, 0, 1)
+  private blowBounds = new THREE.Box3()
+  private blowPartBounds = new THREE.Box3()
+  private blowSphere = new THREE.Sphere()
+  private blowCenter = new THREE.Vector3()
+  private blowImpact = new THREE.Vector3()
+  private blowOffset = new THREE.Vector3()
+  private blowMatrix = new THREE.Matrix4()
 
   constructor(private root: THREE.Group, private dust: (point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void = () => {}) {
     this.fire = new FireEffects(root)
@@ -284,11 +292,12 @@ export class LaserDestruction {
   }
 
   /** Partition the original colored volumes into ten independent rigid fragments. */
-  private shatter(owner: Destructible, point: THREE.Vector3, direction: THREE.Vector3, speed: number) {
+  private shatter(owner: Destructible, point: THREE.Vector3, direction: THREE.Vector3, speed: number,
+    fragmentCount = 10, force = 1) {
     if (!this.world || owner.damaged) return
     const source = this.activate(owner)!
     const groups = [source.solids]
-    while (groups.length < 10) {
+    while (groups.length < fragmentCount) {
       let largest = 0
       for (let i = 1; i < groups.length; i++) {
         if (groups[i].reduce((sum, cell) => sum + cell.volume, 0) > groups[largest].reduce((sum, cell) => sum + cell.volume, 0)) largest = i
@@ -321,8 +330,9 @@ export class LaserDestruction {
       this.updateColliders(chunk)
       const outward = center.clone().sub(point).normalize()
       const velocity = owner.velocity?.clone() ?? new THREE.Vector3()
-      velocity.addScaledVector(direction, Math.min(speed * .3, 18)).addScaledVector(outward, 3 + Math.min(speed * .12, 8))
-      velocity.y += 3
+      velocity.addScaledVector(direction, Math.min(speed * .3, 18) * force)
+        .addScaledVector(outward, (3 + Math.min(speed * .12, 8)) * force)
+      velocity.y += 3 * force
       body.setLinvel(velocity, true)
       body.setAngvel({ x: Math.sin(index * 2.4) * 3, y: Math.cos(index * 1.7) * 3, z: Math.sin(index + .8) * 3 }, true)
       this.root.add(mesh)
@@ -594,6 +604,113 @@ export class LaserDestruction {
   register(owner: Destructible, collider: RAPIER.Collider) {
     owner.colliders.push(collider)
     this.targets.set(collider.handle, owner)
+  }
+
+  /** Shatter intact props within the widening forward cone of a super-breath. */
+  blow(origin: THREE.Vector3, direction: THREE.Vector3, range: number, speed: number) {
+    if (!this.world || direction.lengthSq() < 1e-8) return
+    const axis = direction.clone().normalize()
+    const candidates: { owner: Destructible; chunk?: Chunk; along: number }[] = []
+    for (const owner of this.objects) {
+      if (owner.damaged) {
+        for (const chunk of this.chunks) {
+          if (chunk.owner !== owner || !chunk.mesh.parent) continue
+          chunk.mesh.updateWorldMatrix(true, false)
+          if (!chunk.mesh.geometry.boundingBox) chunk.mesh.geometry.computeBoundingBox()
+          this.blowBounds.copy(chunk.mesh.geometry.boundingBox!).applyMatrix4(chunk.mesh.matrixWorld)
+          this.addBreathCandidate(candidates, owner, chunk, origin, axis, range)
+        }
+      } else if (owner.parts.length) {
+        this.blowBounds.makeEmpty()
+        if (owner.transform) owner.transform.updateWorldMatrix(true, false)
+        for (const part of owner.parts) {
+          if (!part.geometry.boundingBox) part.geometry.computeBoundingBox()
+          this.blowMatrix.copy(part.matrix)
+          if (owner.transform) this.blowMatrix.premultiply(owner.transform.matrixWorld)
+          this.blowPartBounds.copy(part.geometry.boundingBox!).applyMatrix4(this.blowMatrix)
+          this.blowBounds.union(this.blowPartBounds)
+        }
+        this.addBreathCandidate(candidates, owner, undefined, origin, axis, range)
+      }
+    }
+    candidates.sort((a, b) => Number(!!a.chunk) - Number(!!b.chunk) || a.along - b.along)
+    for (const { owner, chunk, along } of candidates.slice(0, MAX_BREATH_TARGETS)) {
+      this.blowImpact.copy(origin).addScaledVector(axis, THREE.MathUtils.clamp(along, 0, range))
+      if (chunk) this.launchChunk(chunk, this.blowImpact, axis, speed, 3)
+      else this.shatter(owner, this.blowImpact, axis, speed, owner.kind === 'building' ? 400 : 10, 3)
+    }
+  }
+
+  private addBreathCandidate(candidates: { owner: Destructible; chunk?: Chunk; along: number }[],
+    owner: Destructible, chunk: Chunk | undefined, origin: THREE.Vector3, axis: THREE.Vector3, range: number) {
+    if (this.blowBounds.isEmpty()) return
+    this.blowBounds.getCenter(this.blowCenter)
+    this.blowOffset.copy(this.blowCenter).sub(origin)
+    const along = this.blowOffset.dot(axis)
+    const reach = this.blowBounds.getBoundingSphere(this.blowSphere).radius
+    if (along + reach < 0 || along - reach > range) return
+    this.blowImpact.copy(origin).addScaledVector(axis, THREE.MathUtils.clamp(along, 0, range))
+    if (this.blowCenter.distanceTo(this.blowImpact) > .12 * Math.max(0, along) + reach) return
+    candidates.push({ owner, chunk, along })
+  }
+
+  private launchChunk(chunk: Chunk, point: THREE.Vector3, direction: THREE.Vector3, speed: number, force = 1) {
+    const world = this.world
+    if (!world) return
+    if (!chunk.body) {
+      if (chunk.archiveKey || chunk.hydrating) {
+        this.touch(chunk.owner)
+        void this.hydrateChunk(chunk)
+        return
+      }
+      if (!chunk.solids.length) return
+      if (!chunk.mesh.geometry.boundingBox) chunk.mesh.geometry.computeBoundingBox()
+      const center = chunk.mesh.geometry.boundingBox!.getCenter(new THREE.Vector3())
+      const previousSolids = chunk.solids
+      const cells = previousSolids.map(cell => translatedSolid(cell, center.clone().negate()))
+      const translated = new Map(previousSolids.map((cell, index) => [cell, cells[index]]))
+      const connections: SolidConnections = new Map(cells.map(cell => [cell, new Set<LaserSolid>()]))
+      for (const [cell, neighbors] of chunk.connections) {
+        const next = translated.get(cell)
+        if (!next) continue
+        for (const neighbor of neighbors) {
+          const adjacent = translated.get(neighbor)
+          if (adjacent) connections.get(next)!.add(adjacent)
+        }
+      }
+      for (const collider of chunk.colliders) {
+        this.targets.delete(collider.handle)
+        world.removeCollider(collider, true)
+      }
+      chunk.colliders = []
+      chunk.cells.clear()
+      chunk.solids = cells
+      chunk.connections = connections
+      chunk.mesh.geometry.dispose()
+      chunk.mesh.geometry = solidGeometry(cells, new THREE.Vector3())
+      chunk.mesh.position.copy(center)
+      chunk.mesh.quaternion.identity()
+      chunk.body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(center.x, center.y, center.z).setLinearDamping(.12).setAngularDamping(.18).setCcdEnabled(true))
+      chunk.settled = false
+      chunk.debrisAge = 0
+      this.updateColliders(chunk)
+    } else if (chunk.settled || !chunk.body.isDynamic()) {
+      chunk.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true)
+      chunk.settled = false
+      chunk.debrisAge = 0
+    }
+
+    const body = chunk.body
+    body.wakeUp()
+    const velocity = new THREE.Vector3().copy(body.linvel())
+      .addScaledVector(direction, Math.min(speed * .3, 18) * force)
+    const outward = new THREE.Vector3().copy(body.translation()).sub(point).normalize()
+    velocity.addScaledVector(outward, (3 + Math.min(speed * .12, 8)) * force)
+    velocity.y += 3 * force
+    velocity.clampLength(0, 55 * force)
+    body.setLinvel(velocity, true)
+    body.setAngvel({ x: Math.sin(chunk.mesh.id) * 3, y: Math.cos(chunk.mesh.id) * 3, z: Math.sin(chunk.mesh.id + .8) * 3 }, true)
   }
 
   ownerOf(collider: RAPIER.Collider) {

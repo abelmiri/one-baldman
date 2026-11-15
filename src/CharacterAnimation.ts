@@ -114,6 +114,7 @@ export class CharacterAnimation {
   private rest = new THREE.Vector3()
   private hip = new THREE.Vector3()
   private delta = new THREE.Vector3()
+  blowWeight = 0
 
   resetFeet() {
     for (const foot of this.feet) {
@@ -128,6 +129,21 @@ export class CharacterAnimation {
     this.lastStep = -1
     this.weight = this.speed = this.previousSpeed = this.acceleration = this.run = 0
     this.travelForward = this.travelSide = 0
+    this.blowWeight = 0
+  }
+
+  blow(dt: number, active: boolean) {
+    this.blowWeight = damp(this.blowWeight, active ? 1 : 0, active ? 7 : 5, dt)
+    const weight = this.blowWeight
+    this.pitch -= .10 * weight
+    this.neck -= .12 * weight
+    this.head += .16 * weight
+    for (const pose of [this.left, this.right]) {
+      pose.shoulder = lerp(pose.shoulder, -.32, weight)
+      pose.upperArm = lerp(pose.upperArm, -.34, weight)
+      pose.elbow = lerp(pose.elbow, -.82, weight)
+      pose.wrist = lerp(pose.wrist, -.08, weight)
+    }
   }
 
   getUp(style: GetUpStyle, progress: number) {

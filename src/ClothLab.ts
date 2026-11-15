@@ -8,6 +8,7 @@ import { CapeSurface } from './CapeSurface'
 import { CapeMotion } from './CapeMotion'
 import { ImpactDust } from './ImpactDust'
 import { WindEffect } from './WindEffect'
+import { BlowEffect, BLOW_RANGE } from './BlowEffect'
 import { GameAudio } from './GameAudio'
 import { ImpactShake } from './ImpactShake'
 
@@ -106,6 +107,8 @@ export class ClothLab {
   private touchRunning = false
   private touchDescending = false
   private touchLaser = false
+  private touchBlow = false
+  private blowCooldown = 0
   private impactDestruction = false
   private impactDestructionUntil: number | null = null
   private impactDestructionRecovery = false
@@ -117,6 +120,9 @@ export class ClothLab {
   private heatVision: HeatVision
   private impactDust: ImpactDust
   private windEffect: WindEffect
+  private blowEffect: BlowEffect
+  private blowOrigin = new THREE.Vector3()
+  private blowDirection = new THREE.Vector3()
   private audio = new GameAudio()
   private telemetryTime = 0
   private renderDirty = true
@@ -147,7 +153,7 @@ export class ClothLab {
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.domElement.className = 'scene-canvas'
     this.renderer.domElement.tabIndex = 0
-    this.renderer.domElement.setAttribute('aria-label', 'بازی شهر ساحلی؛ WASD حرکت، Space برخاستن و صعود، W پرواز در جهت موس، Shift همراه W سرعت ۱۰ برابر، C فرود، F لیزر چشم، X رهاشدن؛ کلیک برای کنترل موس و Escape برای منو')
+    this.renderer.domElement.setAttribute('aria-label', 'بازی شهر ساحلی؛ WASD حرکت، Space برخاستن و صعود، W پرواز در جهت موس، Shift همراه W سرعت ۱۰ برابر، C فرود، F لیزر چشم، G فوت پرقدرت، X رهاشدن؛ کلیک برای کنترل موس و Escape برای منو')
     host.appendChild(this.renderer.domElement)
 
     this.camera.position.set(0, 250, 190)
@@ -181,6 +187,7 @@ export class ClothLab {
     this.city = new City(this.scene, this.renderer.capabilities.getMaxAnisotropy(), this.invalidate, this.onDebris)
     this.heatVision = new HeatVision(this.scene)
     this.windEffect = new WindEffect(this.scene)
+    this.blowEffect = new BlowEffect(this.scene)
 
     this.renderer.domElement.addEventListener('pointerdown', this.onPointerDown, true)
     document.addEventListener('mousemove', this.onMouseMove)
@@ -437,6 +444,23 @@ export class ClothLab {
     this.heatVision.update(this.settings.playing ? delta : 0, this.settings.playing && this.settings.standing
       && !this.ragdoll?.isReleased && !this.ragdoll?.isRecovering && (this.keys.has('KeyF') || this.touchLaser),
       this.ragdoll?.parts.get('head')?.mesh, this.camera, this.world, this.city.destruction)
+    const blowing = this.settings.playing && this.settings.standing && !this.ragdoll?.isReleased && !this.ragdoll?.isRecovering
+      && (this.keys.has('KeyG') || this.touchBlow)
+    const head = this.ragdoll?.parts.get('head')?.mesh
+    if (blowing && head) {
+      this.camera.getWorldDirection(this.blowDirection).normalize()
+      this.blowOrigin.set(0, -.045, .18)
+      head.localToWorld(this.blowOrigin)
+      this.blowEffect.update(delta, true, this.blowOrigin, this.blowDirection)
+      this.blowCooldown -= delta
+      if (this.blowCooldown <= 0) {
+        this.city.destruction.blow(this.blowOrigin, this.blowDirection, BLOW_RANGE, 80)
+        this.blowCooldown = .18
+      }
+    } else {
+      this.blowCooldown = 0
+      this.blowEffect.update(0, false, this.blowOrigin, this.blowDirection)
+    }
     this.audio.update(this.settings.playing && !document.hidden && document.hasFocus(),
       this.heatVision.group.visible, this.heatVision.isHittingSurface,
       !!this.ragdoll?.isAirborne, this.ragdoll?.speed ?? 0)
@@ -593,6 +617,10 @@ export class ClothLab {
     this.touchLaser = pressed && this.settings.playing && !this.ragdoll?.isReleased && !this.ragdoll?.isRecovering
   }
 
+  setTouchBlow(pressed: boolean) {
+    this.touchBlow = pressed && this.settings.playing && this.settings.standing && !this.ragdoll?.isReleased && !this.ragdoll?.isRecovering
+  }
+
   toggleRelease() {
     if (!this.settings.playing || !this.settings.standing || this.ragdoll?.isRecovering) return
     this.clearMovement()
@@ -646,6 +674,8 @@ export class ClothLab {
     this.touchRunning = false
     this.touchDescending = false
     this.touchLaser = false
+    this.touchBlow = false
+    this.ragdoll?.setBlowing(false)
     this.heatVision?.stop()
   }
 
@@ -677,7 +707,7 @@ export class ClothLab {
       return
     }
     if (this.ragdoll?.isReleased || this.ragdoll?.isRecovering) return
-    if (MOVEMENT_KEYS.has(event.code) || event.code === 'Space' || event.code === 'KeyC' || event.code === 'KeyF' || event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
+    if (MOVEMENT_KEYS.has(event.code) || event.code === 'Space' || event.code === 'KeyC' || event.code === 'KeyF' || event.code === 'KeyG' || event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
       this.keys.add(event.code)
       event.preventDefault()
       if (MOVEMENT_KEYS.has(event.code) && this.settings.sitting) this.onSitChange(false)
@@ -694,7 +724,9 @@ export class ClothLab {
     const right = Number(this.keys.has('KeyD') || this.keys.has('ArrowRight') || this.touchDirections.has('right'))
       - Number(this.keys.has('KeyA') || this.keys.has('ArrowLeft') || this.touchDirections.has('left'))
     this.camera.getWorldDirection(this.movementForward)
-    this.ragdoll!.setFlightAim(this.movementForward, forward, this.keys.has('KeyF') || this.touchLaser)
+    this.ragdoll!.setFlightAim(this.movementForward, forward, this.keys.has('KeyF') || this.touchLaser
+      || this.keys.has('KeyG') || this.touchBlow)
+    this.ragdoll!.setBlowing(this.keys.has('KeyG') || this.touchBlow)
     const ascent = this.keys.has('Space') || this.touchFlight
     const airborne = this.ragdoll!.isAirborne || ascent
     if (!airborne) this.movementForward.y = 0
@@ -774,6 +806,7 @@ export class ClothLab {
     this.controls.removeEventListener('change', this.invalidate)
     this.controls.dispose()
     this.heatVision.dispose()
+    this.blowEffect.dispose()
     this.impactDust.dispose()
     this.windEffect.dispose()
     this.audio.dispose()

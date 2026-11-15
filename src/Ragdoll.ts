@@ -106,6 +106,7 @@ export class Ragdoll {
   private headEuler = new THREE.Euler(0, 0, 0, 'XYZ')
   private flightEuler = new THREE.Euler(0, 0, 0, 'YXZ')
   private sitting = false
+  private blowing = false
   private sitBlend = 0
   private heading = 0
   private standHeight = STAND_HEIGHT
@@ -328,6 +329,10 @@ export class Ragdoll {
     this.aiming = aiming
   }
 
+  setBlowing(active: boolean) {
+    this.blowing = active && this.standing && !this.released && !this.recovery
+  }
+
   get isAirborne() { return this.airborne }
 
   get viewHeading() { return this.heading }
@@ -512,6 +517,7 @@ export class Ragdoll {
     this.animation.fly(dt, this.falling ? 0 : this.flightBlend, this.flightPitch, bank, this.verticalVelocity,
       launch, this.falling ? 1 : approach, this.moveVelocity.length(), this.flightTravel.z, this.flightTravel.x,
       THREE.MathUtils.smootherstep(this.flightBoost, 0, 1))
+    this.animation.blow(dt, this.blowing)
     this.flightEuler.set(this.animation.pitch, this.heading, this.animation.roll, 'YXZ')
     this.flightRotation.setFromEuler(this.flightEuler)
     this.torsoTarget.copy(this.flightRotation)
@@ -620,7 +626,7 @@ export class Ragdoll {
     if (this.airborne && chestRotation) {
       const yaw = Math.hypot(this.viewDirection.x, this.viewDirection.z) > .001
         ? Math.atan2(this.viewDirection.x, this.viewDirection.z) : this.heading
-      const pitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1))
+      const pitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1)) + this.animation.blowWeight * .12
       this.headEuler.set(pitch, yaw, 0, 'YXZ')
       this.headAim.setFromEuler(this.headEuler).premultiply(this.q2.copy(chestRotation).invert())
       // Split the complete relative rotation across neck and head. This also
@@ -638,8 +644,8 @@ export class Ragdoll {
       const pitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1)) - this.animation.pitch
       const yaw = Math.atan2(this.viewDirection.x, this.viewDirection.z) - this.heading
       const turn = Math.atan2(Math.sin(yaw), Math.cos(yaw))
-      this.ballPose('neck', pitch * .32, 70, turn * .4)
-      this.ballPose('head', pitch * .68, 50, turn * .6)
+      this.ballPose('neck', pitch * .32 - this.animation.blowWeight * .08, 70, turn * .4)
+      this.ballPose('head', pitch * .68 + this.animation.blowWeight * .16, 50, turn * .6)
     } else {
       this.ballPose('neck', this.animation.neck * (1 - this.sitBlend), 70)
       this.ballPose('head', this.animation.head * (1 - this.sitBlend), 50)
@@ -775,6 +781,7 @@ export class Ragdoll {
     this.landingImpact = THREE.MathUtils.damp(this.landingImpact, 0, 7, dt)
     this.animation.walk(dt, this.pelvisPosition, this.pelvisRotation, this.heading,
       this.measuredVelocity, this.running, this.turnRate, this.landingImpact, this.sampleGround, this.footContacts)
+    this.animation.blow(dt, this.blowing)
     const lowerBlend = THREE.MathUtils.smoothstep(this.sitBlend, .65, .98)
     const poseBlend = THREE.MathUtils.smoothstep(this.sitBlend, 0, .70)
     this.flightEuler.set(THREE.MathUtils.lerp(this.animation.pitch, .04, poseBlend), this.heading,

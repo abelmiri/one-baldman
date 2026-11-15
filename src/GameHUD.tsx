@@ -5,15 +5,15 @@ import { CITY_SCALE } from './City'
 
 const initialTelemetry: FlightTelemetry = { state: 'grounded', altitude: 0, speed: 0, x: 0, z: 0, heading: 0 }
 
-function HoldAction({ label, shortcut, disabled, onHold }: {
-  label: string; shortcut: string; disabled: boolean; onHold: (pressed: boolean) => void
+function HoldAction({ label, shortcut, disabled, onHold, tone = '' }: {
+  label: string; shortcut: string; disabled: boolean; onHold: (pressed: boolean) => void; tone?: string
 }) {
   const [pressed, setPressed] = useState(false)
   useEffect(() => {
     if (disabled) { onHold(false); setPressed(false) }
   }, [disabled, onHold])
   const release = () => { onHold(false); setPressed(false) }
-  return <button type="button" className={`power-button ${pressed ? 'engaged' : ''}`}
+  return <button type="button" className={`power-button ${tone} ${pressed ? 'engaged' : ''}`}
     disabled={disabled} aria-label={`${label}؛ نگه دارید`} aria-pressed={pressed}
     onPointerDown={event => {
       event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
@@ -124,11 +124,13 @@ export default function GameHUD({ lab, telemetrySink, ready, menu }: {
             }} onBlur={releaseRun}>شتاب ۱۰×</button>
           <HoldAction label="لیزر چشم" shortcut="F" disabled={!ready || menu || released || recovering}
             onHold={pressed => lab.current?.setTouchLaser(pressed)} />
+          <HoldAction label="فوت پرقدرت" shortcut="G" tone="blow-button" disabled={!ready || menu || released || recovering}
+            onHold={pressed => lab.current?.setTouchBlow(pressed)} />
           <HoldAction label="فرود" shortcut="C" disabled={!ready || menu || released || recovering || !airborne}
             onHold={pressed => lab.current?.setTouchDescending(pressed)} />
         </div>
         <div className="flight-hint">{released ? <><kbd>X</kbd> بازگشت کنترل</> : recovering ? 'پس از بلندشدن، حرکت و پرواز فعال می‌شوند' : airborne ? <><kbd>W</kbd> جهت موس <span>·</span> <kbd>SHIFT + W</kbd> شتاب ۱۰×</>
-          : <><span dir="ltr">W A S D</span> حرکت <span>·</span> <kbd>F</kbd> لیزر چشم</>}</div>
+          : <><span dir="ltr">W A S D</span> حرکت <span>·</span> <kbd>F</kbd> لیزر چشم <span>·</span> <kbd>G</kbd> فوت پرقدرت</>}</div>
       </div>
       <div className="flight-instruments" aria-label="وضعیت پرواز">
         <div className="instrument-heading"><span className="instrument-dot" /><span>{released ? 'بدن رها' : recovering ? 'در حال بلندشدن' : airborne ? 'سامانهٔ پرواز' : 'روی زمین'}</span><span dir="ltr">{released ? 'FREE' : recovering ? 'GET UP' : airborne ? 'AIR' : 'GND'}</span></div>

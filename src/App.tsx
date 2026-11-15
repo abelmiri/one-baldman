@@ -127,7 +127,7 @@ export default function App() {
         <div className="pause-intro">
           <Wings className="pause-emblem" /><span className="pause-overline">PATROL ON HOLD</span>
           <h1 id="pause-title">شهر منتظر توست.</h1><p>نفسی تازه کن؛ گشت هنوز ادامه دارد.</p>
-          <div className="menu-guide"><span>کلیک روی صحنه؛ حرکت موس برای چرخش دوربین</span><span><kbd>ESC</kbd> آزاد کردن موس و منو</span><span><kbd>SPACE</kbd> برخاستن و صعود؛ رهاکردن برای شناوری</span><span><kbd>W</kbd> پرواز در جهت موس؛ WASD حرکت</span><span><kbd>SHIFT + W</kbd> پرواز با سرعت ۱۰ برابر</span><span><kbd>C</kbd> پایین آمدن و فرود</span><span><kbd>F</kbd> نگه‌داشتن برای لیزر چشم</span><span><kbd>X</kbd> رهاشدن بدن / بازگشت کنترل و بلندشدن</span></div>
+          <div className="menu-guide"><span>کلیک روی صحنه؛ حرکت موس برای چرخش دوربین</span><span><kbd>ESC</kbd> آزاد کردن موس و منو</span><span><kbd>SPACE</kbd> برخاستن و صعود؛ رهاکردن برای شناوری</span><span><kbd>W</kbd> پرواز در جهت موس؛ WASD حرکت</span><span><kbd>SHIFT + W</kbd> پرواز با سرعت ۱۰ برابر</span><span><kbd>C</kbd> پایین آمدن و فرود</span><span><kbd>F</kbd> نگه‌داشتن برای لیزر چشم</span><span><kbd>G</kbd> نگه‌داشتن برای فوت پرقدرت و خردکردن شهر</span><span><kbd>X</kbd> رهاشدن بدن / بازگشت کنترل و بلندشدن</span></div>
           <span className="pause-footer">COASTAL CITY <i /> FREE ROAM</span>
         </div>
         <div className="pause-actions">

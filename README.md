@@ -7,6 +7,7 @@
 Take to the skies in a 3D superhero sandbox. Explore the streets, soar above the rooftops, and carve through the city with twin eye lasers.
 
 - ⚡ **Fly fast** — hover, dive, and boost through the skyline.
+- 🌬️ **Blow things away** — hold `G` to shatter and launch buildings, cars, and trees with a powerful breath.
 - 🔥 **Break things** — cut through buildings and watch the debris fall.
 - 🪂 **Let go** — tumble with ragdoll physics and a flowing red cape.
 - 🌙 **Roam freely** — explore by day or night, on desktop or with touch controls.
@@ -16,7 +17,7 @@ Take to the skies in a 3D superhero sandbox. Explore the streets, soar above the
 **Take control**
 
 - `WASD` Move · `Space` Ascend · `C` Descend · `Shift` Boost
-- `F` Eye lasers · `X` Ragdoll / Recover · `Mouse` Look · `Esc` Menu
+- `F` Eye lasers · `G` Super-breath · `X` Ragdoll / Recover · `Mouse` Look · `Esc` Menu
 
 **Under the hood**
 
