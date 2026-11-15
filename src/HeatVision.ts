@@ -50,10 +50,15 @@ export class HeatVision {
     scene.add(this.group)
   }
 
-  stop() { this.group.visible = false; this.light.intensity = 0; this.cutTime = 0 }
+  stop() {
+    this.group.visible = false; this.light.intensity = 0; this.cutTime = 0
+  }
+
+  get isHittingSurface() { return this.group.visible && this.impacts.some(impact => impact.visible) }
 
   update(dt: number, active: boolean, head: THREE.Object3D | undefined,
     camera: THREE.Camera, world: RAPIER.World | null, destruction?: LaserDestruction) {
+    destruction?.updateBurns(dt)
     if (!active || !head || !world) { this.stop(); destruction?.endStroke(); return }
     this.time += dt
     this.cutTime += dt
@@ -77,7 +82,7 @@ export class HeatVision {
       this.direction.copy(this.aim).sub(this.eyePosition).normalize()
       this.ray.origin = this.eyePosition
       this.ray.dir = this.direction
-      const hit = world.castRay(this.ray, RANGE, true, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS,
+      const hit = world.castRayAndGetNormal(this.ray, RANGE, true, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS,
         undefined, undefined, undefined, collider => !!((collider.collisionGroups() >>> 16) & 1))
       const length = Math.min(hit?.timeOfImpact ?? RANGE, this.eyePosition.distanceTo(this.aim))
       const beam = this.beams[i]
@@ -89,11 +94,16 @@ export class HeatVision {
       impact.visible = !!hit
       impact.position.copy(this.eyePosition).addScaledVector(this.direction, length)
       impact.scale.setScalar(.11 + Math.sin(this.time * 47 + i) * .025)
-      if (cutting && hit) this.hits.push({ collider: hit.collider, point: impact.position.clone(), direction: this.direction.clone(), eye: i })
-      else if (cutting) destruction?.endStroke(i)
+      const owner = hit && destruction?.ownerOf(hit.collider)
+      if (hit && owner?.kind === 'building') {
+        destruction?.ignite(hit.collider, impact.position, this.direction, hit.normal)
+        destruction?.endStroke(i)
+      } else if (cutting && hit) {
+        this.hits.push({ collider: hit.collider, point: impact.position.clone(), direction: this.direction.clone(), eye: i })
+      } else if (!hit) destruction?.endStroke(i)
     }
     // Query both eyes before changing colliders referenced by this frame's hits.
-    for (const hit of this.hits) destruction?.cut(hit.collider, hit.point, hit.direction, hit.eye)
+    destruction?.cutMany(this.hits)
     this.light.position.copy(this.eyes[0].position).lerp(this.eyes[1].position, .5)
     this.light.intensity = 2.4 + Math.sin(this.time * 41) * .5
   }

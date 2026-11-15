@@ -18,6 +18,7 @@ export default function App() {
   const [menu, setMenu] = useState(false)
   const [view, setView] = useState<CameraView>('player')
   const [night, setNight] = useState(false)
+  const [muted, setMuted] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const telemetrySink = useRef<(telemetry: FlightTelemetry) => void>(() => {})
   const install = useInstall()
@@ -48,6 +49,7 @@ export default function App() {
   }, [menu, ready])
   useEffect(() => { lab.current?.setCameraView(view) }, [view, ready])
   useEffect(() => { lab.current?.setNight(night) }, [night, ready])
+  useEffect(() => { lab.current?.setMuted(muted) }, [muted, ready])
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.code === 'Escape' && !event.repeat) {
@@ -122,8 +124,13 @@ export default function App() {
     {menu && <div className="pause-overlay">
       <div className="pause-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-title" ref={dialog} tabIndex={-1}>
         <button type="button" className="close-menu" aria-label="بستن منو" onClick={() => resumeGame()}>×</button>
-        <Wings className="pause-emblem" /><span className="pause-overline">PATROL ON HOLD</span>
-        <h1 id="pause-title">شهر منتظر توست.</h1><p>نفسی تازه کن؛ گشت هنوز ادامه دارد.</p>
+        <div className="pause-intro">
+          <Wings className="pause-emblem" /><span className="pause-overline">PATROL ON HOLD</span>
+          <h1 id="pause-title">شهر منتظر توست.</h1><p>نفسی تازه کن؛ گشت هنوز ادامه دارد.</p>
+          <div className="menu-guide"><span>کلیک روی صحنه؛ حرکت موس برای چرخش دوربین</span><span><kbd>ESC</kbd> آزاد کردن موس و منو</span><span><kbd>SPACE</kbd> برخاستن و صعود؛ رهاکردن برای شناوری</span><span><kbd>W</kbd> پرواز در جهت موس؛ WASD حرکت</span><span><kbd>SHIFT + W</kbd> پرواز با سرعت ۱۰ برابر</span><span><kbd>C</kbd> پایین آمدن و فرود</span><span><kbd>F</kbd> نگه‌داشتن برای لیزر چشم</span><span><kbd>X</kbd> رهاشدن بدن / بازگشت کنترل و بلندشدن</span></div>
+          <span className="pause-footer">COASTAL CITY <i /> FREE ROAM</span>
+        </div>
+        <div className="pause-actions">
         <button className="resume-button" type="button" onClick={() => resumeGame()}>ادامهٔ بازی <span aria-hidden="true">←</span></button>
         <div className="menu-options">
           {!install.installed && <button type="button" onClick={install.install} disabled={install.busy} aria-expanded={install.help} aria-controls={install.help ? 'install-help' : undefined}>
@@ -141,6 +148,9 @@ export default function App() {
           <button type="button" role="switch" aria-checked={night} onClick={() => setNight(current => !current)}>
             <span className="option-icon" aria-hidden="true">☾</span><span>حالت شب</span><span className={`game-switch ${night ? 'on' : ''}`}><i /></span>
           </button>
+          <button type="button" role="switch" aria-checked={!muted} onClick={() => { lab.current?.setMuted(!muted); setMuted(!muted) }}>
+            <span className="option-icon" aria-hidden="true">♪</span><span>صدای بازی</span><span className={`game-switch ${!muted ? 'on' : ''}`}><i /></span>
+          </button>
           {document.fullscreenEnabled && <button type="button" onClick={toggleFullscreen}>
             <span className="option-icon" aria-hidden="true">⛶</span><span>{fullscreen ? 'خروج از تمام‌صفحه' : 'تمام‌صفحه'}</span><span className="option-detail" aria-hidden="true">↗</span>
           </button>}
@@ -148,8 +158,7 @@ export default function App() {
             <span className="option-icon" aria-hidden="true">↻</span><span>شروع مجدد</span><span className="option-detail" aria-hidden="true">↗</span>
           </button>
         </div>
-        <div className="menu-guide"><span>کلیک روی صحنه؛ حرکت موس برای چرخش دوربین</span><span><kbd>ESC</kbd> آزاد کردن موس و منو</span><span><kbd>SPACE</kbd> برخاستن و صعود؛ رهاکردن برای شناوری</span><span><kbd>W</kbd> پرواز در جهت موس؛ WASD حرکت</span><span><kbd>SHIFT + W</kbd> پرواز با سرعت ۱۰ برابر</span><span><kbd>C</kbd> پایین آمدن و فرود</span><span><kbd>F</kbd> نگه‌داشتن برای لیزر چشم</span><span><kbd>X</kbd> رهاشدن بدن / بازگشت کنترل و بلندشدن</span></div>
-        <span className="pause-footer">COASTAL CITY <i /> FREE ROAM</span>
+        </div>
       </div>
     </div>}
 

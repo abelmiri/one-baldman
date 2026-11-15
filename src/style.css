@@ -46,3 +46,119 @@
 @media (pointer: coarse) and (max-height: 570px) and (min-width: 701px) {
   .touch-movement { bottom: max(20px, env(safe-area-inset-bottom)); }
 }
+
+/* Pause menu */
+.pause-overlay {
+  overflow: hidden;
+  padding: 24px;
+  background: radial-gradient(circle at 50% 45%, #173139b8, #061014ed 75%);
+}
+.pause-dialog {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  gap: clamp(24px, 4vw, 48px);
+  width: min(820px, 100%);
+  max-height: min(680px, calc(100dvh - 48px));
+  padding: clamp(28px, 4vw, 48px);
+  border-radius: 12px;
+  background: linear-gradient(145deg, #1b3035f7, #101e23fc 58%, #0d191dfe);
+  box-shadow: 0 28px 100px #0009, inset 0 1px #ffffff14;
+  text-align: right;
+  overflow: hidden;
+}
+.pause-dialog::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 48%;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 10%, #d5ae5d12, transparent 70%);
+}
+.pause-intro, .pause-actions { position: relative; min-width: 0; }
+.pause-intro { display: flex; flex-direction: column; align-items: flex-start; }
+.pause-emblem { width: 72px; margin: 0 0 16px; }
+.pause-dialog h1 { font-size: clamp(26px, 3vw, 34px); line-height: 1.25; margin: 15px 0 8px; }
+.pause-dialog p { margin-bottom: 0; }
+.menu-guide {
+  align-items: flex-start;
+  gap: 9px;
+  margin: auto 0 25px;
+  padding-top: 26px;
+  text-align: right;
+  line-height: 1.5;
+}
+.pause-footer { margin-top: 0; }
+.pause-actions { display: flex; flex-direction: column; justify-content: center; }
+.resume-button {
+  min-height: 58px;
+  border-radius: 5px;
+  box-shadow: 0 8px 28px #0003, inset 0 1px #fff5;
+}
+.menu-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }
+.menu-options > button {
+  min-height: 64px;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid #d9dfd526;
+  border-radius: 5px;
+  background: #dfe9df09;
+  line-height: 1.45;
+}
+.menu-options > button:hover { border-color: #e5bd7080; background: #e5bd7015; }
+.option-icon { flex: 0 0 22px; color: var(--gold); }
+.option-detail, .game-switch { margin-right: auto; flex-shrink: 0; }
+.install-help { grid-column: 1 / -1; max-height: 150px; overflow-y: auto; margin: 0; }
+.close-menu { z-index: 2; left: 18px; top: 16px; font-size: 27px; }
+
+@media (max-width: 700px) {
+  .pause-overlay { inset: 0; padding: 0; place-items: stretch; }
+  .pause-dialog {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: clamp(18px, 5dvh, 34px);
+    width: 100%;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    padding: max(30px, env(safe-area-inset-top)) 20px max(22px, env(safe-area-inset-bottom));
+    border: 0;
+    border-radius: 0;
+  }
+  .pause-intro { align-items: center; text-align: center; flex: 0 0 auto; }
+  .pause-emblem { width: clamp(42px, 7dvh, 60px); margin: 0 0 8px; }
+  .pause-overline, .pause-dialog p, .menu-guide, .pause-footer { display: none; }
+  .pause-dialog h1 { margin: 0; font-size: clamp(22px, 4dvh, 28px); }
+  .pause-actions { flex: 0 1 auto; }
+  .resume-button { min-height: 55px; }
+  .menu-options { gap: 8px; margin-top: 10px; }
+  .menu-options > button { min-height: clamp(48px, 8dvh, 64px); padding: 9px 10px; font-size: 11px; }
+  .option-icon { flex-basis: 19px; width: 19px; font-size: 19px; }
+  .option-detail { font-size: 14px; }
+  .close-menu { top: max(14px, env(safe-area-inset-top)); left: 15px; }
+  .install-help {
+    position: fixed;
+    z-index: 3;
+    right: 14px;
+    left: 14px;
+    bottom: max(18px, env(safe-area-inset-bottom));
+    max-height: min(40dvh, 260px);
+    overflow-y: auto;
+    margin: 0;
+    font-size: 10px;
+    background: #15262bf5;
+    box-shadow: 0 12px 40px #0009;
+  }
+}
+@media (max-height: 600px) and (min-width: 701px) {
+  .pause-dialog { padding-block: 24px; }
+  .pause-emblem { width: 48px; margin-bottom: 8px; }
+  .menu-guide, .pause-footer { display: none; }
+  .menu-options > button { min-height: 48px; }
+}
+@media (max-width: 370px), (max-height: 600px) and (max-width: 700px) {
+  .pause-dialog { gap: 12px; padding-inline: 14px; }
+  .pause-emblem { display: none; }
+  .menu-options > button { min-height: 44px; padding: 7px; font-size: 10px; }
+  .resume-button { min-height: 48px; }
+}

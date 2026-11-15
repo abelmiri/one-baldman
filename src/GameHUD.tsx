@@ -1,6 +1,7 @@
 import { useEffect, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import type { ClothLab, FlightTelemetry, MovementDirection } from './ClothLab'
 import Wings from './Wings'
+import { CITY_SCALE } from './City'
 
 const initialTelemetry: FlightTelemetry = { state: 'grounded', altitude: 0, speed: 0, x: 0, z: 0, heading: 0 }
 
@@ -39,7 +40,7 @@ function Radar({ telemetry }: { telemetry: FlightTelemetry }) {
       <rect x="87" y="31" width="40" height="19" className="radar-building" />
       <circle cx="107" cy="40" r="9" className="radar-building" />
       <path d="M130 80H170V98H130ZM125 125H149V149H125ZM28 36H46V56H28Z" className="radar-building" />
-      <g transform={`translate(${Math.max(7, Math.min(193, 100 + telemetry.x))}, ${Math.max(7, Math.min(193, 100 + telemetry.z))})`}>
+      <g transform={`translate(${Math.max(7, Math.min(193, 100 + telemetry.x / CITY_SCALE))}, ${Math.max(7, Math.min(193, 100 + telemetry.z / CITY_SCALE))})`}>
         <circle r="9" className="radar-pulse" />
         <path d="M0 7 -4 -4 0 -2 4 -4Z" transform={`rotate(${-telemetry.heading * 180 / Math.PI})`} className="radar-player" />
       </g>

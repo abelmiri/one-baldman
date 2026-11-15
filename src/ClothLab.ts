@@ -2,12 +2,14 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import RAPIER from '@dimforge/rapier3d'
 import { Ragdoll } from './Ragdoll'
-import { City } from './City'
+import { City, CITY_SCALE } from './City'
 import { HeatVision } from './HeatVision'
 import { CapeSurface } from './CapeSurface'
 import { CapeMotion } from './CapeMotion'
 import { ImpactDust } from './ImpactDust'
 import { WindEffect } from './WindEffect'
+import { GameAudio } from './GameAudio'
+import { ImpactShake } from './ImpactShake'
 
 export type Mode = 'cape' | 'falling'
 export type MovementDirection = 'forward' | 'backward' | 'left' | 'right'
@@ -38,6 +40,7 @@ const MAX_RENDER_PIXELS = 3_000_000
 const CAMERA_ROTATE_SPEED = 1.35
 const CAMERA_SHOULDER_OFFSET = 1.4
 const CAMERA_DEFAULT_ZOOM = 1.2
+const CAMERA_INTERIOR_ZOOM = 1.3
 const CAMERA_GROUND_CLEARANCE = .35
 const vector = (x: number, y: number, z: number) => ({ x, y, z })
 const MOVEMENT_KEYS = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight'])
@@ -102,9 +105,18 @@ export class ClothLab {
   private touchRunning = false
   private touchDescending = false
   private touchLaser = false
+  private impactDestruction = false
+  private impactDestructionUntil: number | null = null
+  private impactDestructionRecovery = false
+  private destructionContacts: { collider: RAPIER.Collider; point: THREE.Vector3; normal: THREE.Vector3 }[] = []
+  private flightContacts: { collider: RAPIER.Collider; from: THREE.Vector3; to: THREE.Vector3; normal: THREE.Vector3 }[] = []
+  private impactShake = new ImpactShake()
+  private flightFrom = new THREE.Vector3()
+  private flightTo = new THREE.Vector3()
   private heatVision: HeatVision
   private impactDust: ImpactDust
   private windEffect: WindEffect
+  private audio = new GameAudio()
   private telemetryTime = 0
   private renderDirty = true
   private disposed = false
@@ -117,6 +129,7 @@ export class ClothLab {
   private focus = new THREE.Vector3()
   private followOffset = new THREE.Vector3()
   private cameraRight = new THREE.Vector3()
+  private cameraZoom = 1
   private keyLight = new THREE.DirectionalLight('#fff0cf', 3)
   private sunOffset = new THREE.Vector3(-75, 140, 65)
 
@@ -158,13 +171,13 @@ export class ClothLab {
     key.shadow.camera.right = 115
     key.shadow.camera.top = 115
     key.shadow.camera.bottom = -115
-    key.shadow.camera.far = 350
+    key.shadow.camera.far = 350 * CITY_SCALE / 1.5
     key.shadow.normalBias = .16
     key.shadow.bias = -0.00005
     this.scene.add(key, key.target)
 
     this.impactDust = new ImpactDust(this.scene)
-    this.city = new City(this.scene, this.renderer.capabilities.getMaxAnisotropy(), this.invalidate, this.impactDust.burst)
+    this.city = new City(this.scene, this.renderer.capabilities.getMaxAnisotropy(), this.invalidate, this.onDebris)
     this.heatVision = new HeatVision(this.scene)
     this.windEffect = new WindEffect(this.scene)
 
@@ -187,6 +200,11 @@ export class ClothLab {
     const wasPlaying = this.settings.playing
     const rebuild = settings.mode !== this.settings.mode || settings.stiffness !== this.settings.stiffness
     this.settings = { ...settings }
+    if (!settings.standing) {
+      this.impactDestruction = false
+      this.impactDestructionUntil = null
+      this.impactDestructionRecovery = false
+    }
     if (this.world) this.world.gravity = vector(0, -settings.gravity, 0)
     if (rebuild) this.reset()
     else this.ragdoll?.setStanding(settings.standing)
@@ -202,6 +220,12 @@ export class ClothLab {
   }
 
   reset() {
+    this.impactShake.clear()
+    this.flightContacts.length = 0
+    this.impactDestruction = false
+    this.impactDestructionUntil = null
+    this.impactDestructionRecovery = false
+    this.destructionContacts.length = 0
     this.clearMovement()
     this.impactDust.clear()
     this.capeMotion = null
@@ -228,7 +252,8 @@ export class ClothLab {
     this.capeSurface = null
 
     const cape = this.settings.mode === 'cape'
-    this.ragdoll = new Ragdoll(this.world, this.scene, 0, this.settings.standing, this.impactDust.burst, this.invalidate)
+    this.ragdoll = new Ragdoll(this.world, this.scene, 0, this.settings.standing, this.onImpact, this.invalidate)
+    this.ragdoll.configureFlightDestruction(this.recordFlightContact, this.isBuildingCollider)
     this.ragdoll.controlFocus(this.focus)
     if (this.cameraView === 'player') this.setCameraView('player')
 
@@ -290,7 +315,22 @@ export class ClothLab {
     this.elapsed += STEP
     this.city.stepTraffic(this.elapsed)
     this.updateMovement()
-    this.ragdoll.step(STEP)
+    if (this.impactDestructionUntil !== null && this.elapsed >= this.impactDestructionUntil - 1e-8) {
+      this.impactDestruction = false
+      this.impactDestructionUntil = null
+    }
+    this.destructionContacts.length = 0
+    this.flightContacts.length = 0
+    this.ragdoll.setCollisionProtection(this.impactDestruction && this.settings.standing
+      && (this.impactDestructionRecovery || this.impactDestructionUntil !== null))
+    const destructiveContacts = this.impactDestruction && this.settings.standing && !this.ragdoll.isReleased
+      ? this.recordDestructiveContact : undefined
+    const wasRecovering = this.ragdoll.isRecovering
+    this.ragdoll.step(STEP, destructiveContacts, this.isDestructibleCollider)
+    if (this.impactDestructionRecovery && !this.ragdoll.isRecovering && (wasRecovering || !this.ragdoll.isReleased)) {
+      this.impactDestructionRecovery = false
+      this.impactDestructionUntil = this.elapsed + 3
+    }
     this.capeMotion?.beforeStep(STEP)
     this.cloth.resetForces(true)
     if (this.settings.wind > 0) {
@@ -305,7 +345,11 @@ export class ClothLab {
     }
     this.previousClothPositions.set(this.clothPositions)
     this.world.step()
-    this.ragdoll.checkForImpact()
+    this.ragdoll.checkForImpact(this.ragdoll.isReleased ? undefined : destructiveContacts)
+    for (const contact of this.destructionContacts) this.city.destruction.queueContact(contact.collider, contact.point, contact.normal)
+    for (const contact of this.flightContacts) this.city.destruction.queueFlightPath(contact.collider, contact.from, contact.to, contact.normal)
+    if (this.ragdoll.copyFlightSegment(this.flightFrom, this.flightTo)) this.city.destruction.continueFlightPath(this.flightFrom, this.flightTo)
+    else this.city.destruction.endFlightPath()
     this.capeMotion?.afterStep(STEP)
     this.clothPositions.set(this.cloth.particlePositions())
     this.impactDust.step(STEP)
@@ -356,6 +400,13 @@ export class ClothLab {
     }
     if (this.settings.playing && this.cameraView === 'player' && this.ragdoll) {
       this.ragdoll.renderFocus(this.focus)
+      const interior = this.city.buildingAt(this.focus)
+      const nextZoom = interior ? CAMERA_INTERIOR_ZOOM : 1
+      const zoom = THREE.MathUtils.damp(this.cameraZoom, nextZoom, 6, delta)
+      if (Math.abs(zoom - this.cameraZoom) > 1e-4) {
+        this.camera.position.sub(this.controls.target).multiplyScalar(this.cameraZoom / zoom).add(this.controls.target)
+        this.cameraZoom = zoom
+      }
       // Translate both the camera and its orbit target to the right shoulder.
       // The center ray stays aligned with the reticle while the hero sits left of it.
       this.cameraRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion)
@@ -373,19 +424,43 @@ export class ClothLab {
     this.keepCameraAboveGround()
     this.impactDust.render(this.camera)
     this.ragdoll?.renderFocus(this.focus)
+    if (this.city.updateOcclusion(this.camera, this.focus, delta, this.cameraView === 'player')) this.invalidate()
     this.windEffect.update(Math.max(0, this.elapsed - STEP + this.accumulator), this.focus,
       this.settings.wind, this.settings.windDirection, this.cameraView === 'player')
-    this.heatVision.update(delta, this.settings.playing && this.settings.standing
+    this.heatVision.update(this.settings.playing ? delta : 0, this.settings.playing && this.settings.standing
       && !this.ragdoll?.isReleased && !this.ragdoll?.isRecovering && (this.keys.has('KeyF') || this.touchLaser),
       this.ragdoll?.parts.get('head')?.mesh, this.camera, this.world, this.city.destruction)
+    this.audio.update(this.settings.playing && !document.hidden && document.hasFocus(),
+      this.heatVision.group.visible, this.heatVision.isHittingSurface,
+      !!this.ragdoll?.isAirborne, this.ragdoll?.speed ?? 0)
     if (this.settings.playing || this.renderDirty) {
-      this.renderer.render(this.scene, this.camera)
+      if (this.cameraView === 'player') this.impactShake.apply(this.camera, this.settings.playing ? delta : 0)
+      else this.impactShake.clear()
+      try { this.renderer.render(this.scene, this.camera) }
+      finally { this.impactShake.restore(this.camera) }
       this.renderDirty = false
     }
     this.raf = requestAnimationFrame(this.frame)
   }
 
   private invalidate = () => { this.renderDirty = true }
+
+  setMuted(muted: boolean) { this.audio.setMuted(muted) }
+
+  private playImpact(point: THREE.Vector3Like, speed: number, debris = false) {
+    this.cameraRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion)
+    this.audio.impact(point, speed, this.camera.position, this.cameraRight, debris)
+  }
+
+  private onImpact = (point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => {
+    this.impactDust.burst(point, normal, speed)
+    this.playImpact(point, speed)
+  }
+
+  private onDebris = (point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => {
+    this.impactDust.burst(point, normal, speed)
+    this.playImpact(point, speed, true)
+  }
 
   private adaptResolution(frameDelta: number, delta: number) {
     // Ignore suspension/resize stalls; change resolution slowly to avoid oscillation.
@@ -419,13 +494,14 @@ export class ClothLab {
 
   setCameraView(view: CameraView) {
     this.cameraView = view
+    this.cameraZoom = 1
     // Distant map surfaces need more depth precision than the close character view.
     this.camera.near = view === 'city' ? 3 : .1
     this.camera.updateProjectionMatrix()
     // Flush any remaining orbit damping before changing views.
     this.controls.enableDamping = false
     this.controls.update()
-    const shadowExtent = view === 'city' ? 115 : 24
+    const shadowExtent = view === 'city' ? 115 * CITY_SCALE : 24
     const shadow = this.keyLight.shadow
     shadow.camera.left = shadow.camera.bottom = -shadowExtent
     shadow.camera.right = shadow.camera.top = shadowExtent
@@ -442,11 +518,11 @@ export class ClothLab {
     this.controls.mouseButtons.RIGHT = null
     if (view === 'city') {
       this.unlockPointer()
-      const distance = 119 / Math.tan(THREE.MathUtils.degToRad(21)) / Math.min(1, this.camera.aspect)
+      const distance = 119 * CITY_SCALE / Math.tan(THREE.MathUtils.degToRad(21)) / Math.min(1, this.camera.aspect)
       this.controls.target.set(0, 0, 0)
       this.camera.position.set(0, distance * .94, distance * .342)
       this.controls.minDistance = 30
-      this.controls.maxDistance = 650
+      this.controls.maxDistance = 650 * CITY_SCALE
     } else {
       this.ragdoll?.controlFocus(this.focus)
       this.controls.target.copy(this.focus)
@@ -513,13 +589,41 @@ export class ClothLab {
   toggleRelease() {
     if (!this.settings.playing || !this.settings.standing || this.ragdoll?.isRecovering) return
     this.clearMovement()
-    if (this.ragdoll?.isReleased) this.ragdoll.regainControl()
-    else this.ragdoll?.release()
+    if (this.ragdoll?.isReleased) {
+      this.impactDestruction = true
+      this.impactDestructionUntil = null
+      this.impactDestructionRecovery = true
+      this.ragdoll.regainControl(true)
+    } else if (this.ragdoll) {
+      this.impactDestruction = false
+      this.impactDestructionUntil = null
+      this.impactDestructionRecovery = false
+      this.ragdoll.release(true)
+    }
+  }
+
+  private recordDestructiveContact = (collider: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like) => {
+    const owner = this.city.destruction.ownerOf(collider)
+    if (this.ragdoll?.isBreakingFlight && owner?.kind === 'building') return
+    if (!owner || this.destructionContacts.some(contact => this.city.destruction.ownerOf(contact.collider) === owner
+      && contact.point.distanceToSquared(point) < .25)) return
+    this.destructionContacts.push({ collider, point: new THREE.Vector3().copy(point), normal: new THREE.Vector3().copy(normal) })
+  }
+
+  private isDestructibleCollider = (collider: RAPIER.Collider) => !!this.city.destruction.ownerOf(collider)
+  private isBuildingCollider = (collider: RAPIER.Collider) => this.city.destruction.ownerOf(collider)?.kind === 'building'
+
+  private recordFlightContact = (collider: RAPIER.Collider, from: THREE.Vector3Like, to: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => {
+    const owner = this.city.destruction.ownerOf(collider)
+    if (!owner || this.flightContacts.some(contact => this.city.destruction.ownerOf(contact.collider) === owner)) return
+    this.flightContacts.push({ collider, from: new THREE.Vector3().copy(from), to: new THREE.Vector3().copy(to), normal: new THREE.Vector3().copy(normal) })
+    this.impactShake.hit(speed)
   }
 
   focusGame() { this.renderer.domElement.focus({ preventScroll: true }) }
 
   private clearMovement = () => {
+    this.audio.stop()
     this.keys.clear()
     this.touchDirections.clear()
     this.touchFlight = false
@@ -656,6 +760,7 @@ export class ClothLab {
     this.heatVision.dispose()
     this.impactDust.dispose()
     this.windEffect.dispose()
+    this.audio.dispose()
     this.ragdoll?.dispose()
     this.world?.free()
     this.world = null

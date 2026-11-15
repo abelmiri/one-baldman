@@ -72,6 +72,58 @@ async page => {
       replacement.free();
       results.reset = true;
 
+      // Both eyes may hit the same collider. Keep both hits valid and rebuild once.
+      const batchWorld = new R.World({ x: 0, y: -9.81, z: 0 });
+      system.reset(batchWorld);
+      try {
+        const intact = batchWorld.createCollider(R.ColliderDesc.cuboid(2, 2, 2).setTranslation(0, 2, 0));
+        system.register(owner, intact);
+        let rebuilds = 0;
+        const rebuild = system.rebuild;
+        system.rebuild = function (...args) { rebuilds++; return rebuild.apply(this, args) };
+        try {
+          assert(system.cutMany([
+            { collider: intact, point: new T.Vector3(-.7, 2, -2), direction: axis, eye: 0 },
+            { collider: intact, point: new T.Vector3(.7, 2, -2), direction: axis, eye: 1 },
+          ]), 'batched eye beams did not cut');
+          assert(rebuilds === 1, 'same-frame hits rebuilt the same chunk more than once');
+          batchWorld.step();
+          const batchRay = x => batchWorld.castRay(new R.Ray({ x, y: 2, z: -5 }, axis), 10, true);
+          assert(!batchRay(-.7) && !batchRay(.7), 'one of the eye hits was lost when its collider was replaced');
+          assert(batchRay(0), 'batching deleted material between separate eye beams');
+          rebuilds = 0;
+          assert(!system.cutMany([]) && rebuilds === 0, 'empty batch rebuilt geometry');
+          const chunk = system.chunks.find(chunk => chunk.colliders.length);
+          assert(!system.cut(chunk.colliders[0], new T.Vector3(-.7, 2, -2), axis), 'stationary beam changed an existing hole');
+          assert(rebuilds === 0, 'stationary beam rebuilt geometry');
+          const originalShapes = new Map(chunk.cells);
+          system.cut(chunk.colliders[0], new T.Vector3(.5, 2, -2), axis);
+          assert(rebuilds === 1, 'interpolated stroke rebuilt geometry for each sample');
+          let retained = 0;
+          for (const [cell, shape] of originalShapes) if (chunk.cells.has(cell)) {
+            assert(chunk.cells.get(cell) === shape && shape.isValid(), 'unchanged material lost its physics collider');
+            retained++;
+          }
+          assert(retained > 0, 'incremental cut retained no unchanged colliders');
+          batchWorld.step();
+          for (const x of [-.5, -.25, 0, .25, .5]) assert(!batchRay(x), 'batched stroke left a gap');
+          results.batching = { bothEyes: true, rebuildsPerChunk: 1, stationaryStable: true, continuousStroke: true };
+        } finally { system.rebuild = rebuild }
+        const carOwner = system.create('car');
+        carOwner.parts.push({ geometry, matrix: new T.Matrix4().makeTranslation(10, 2, 0), color: new T.Color('red') });
+        const carCollider = batchWorld.createCollider(R.ColliderDesc.cuboid(2, 2, 2).setTranslation(10, 2, 0));
+        system.register(carOwner, carCollider);
+        system.cut(carCollider, new T.Vector3(10, 2, -2), axis);
+        const carChunk = system.chunks.find(chunk => chunk.owner === carOwner);
+        const body = carChunk.body;
+        assert(body, 'car fragment has no dynamic body');
+        const spin = { x: .1, y: .2, z: .3 };
+        body.setAngvel(spin, true);
+        system.cut(carChunk.colliders[0], new T.Vector3(10.15, 2, -2), axis);
+        assert(system.chunks.find(chunk => chunk.owner === carOwner).body === body && body.isValid(), 'connected fragment recreated its rigid body');
+        assert(Number.isFinite(body.mass()) && body.mass() > 0, 'incremental collider updates corrupted mass');
+      } finally { system.reset(world); batchWorld.free() }
+
       // Exercise actual city ownership, parked/moving cars, canopy and eye-beam integration.
       lab.reset();
       const city = lab.city, destruction = city.destruction;
@@ -101,12 +153,20 @@ async page => {
       results.city = { buildings: true, trees: true, movingCars: true };
       lab.reset();
       const building = city.destruction.objects.find(owner => owner.kind === 'building');
-      const bounds = new T.Box3().setFromBufferAttribute(building.parts[1].geometry.attributes.position).applyMatrix4(building.parts[1].matrix);
+      const bounds = building.parts.reduce((bounds, part) => bounds.union(new T.Box3().setFromBufferAttribute(part.geometry.attributes.position).applyMatrix4(part.matrix)), new T.Box3());
       const aim = bounds.getCenter(new T.Vector3());
       const head = new T.Object3D(); head.position.copy(aim).add(new T.Vector3(0, 0, -12)); head.updateMatrixWorld();
       const camera = new T.PerspectiveCamera(); camera.position.copy(head.position).add(new T.Vector3(0, 0, -5)); camera.lookAt(aim); camera.updateMatrixWorld();
       lab.world.step();
       for (let i = 0; i < 4; i++) { lab.heatVision.update(1 / 30, true, head, camera, lab.world, city.destruction); lab.world.step() }
+      assert(!building.damaged, 'eye beams destroyed a building before its surface heated up');
+      assert(city.destruction.burnMarks.count > 0, 'building surface did not glow red while burning');
+      for (let i = 4; i < 47; i++) { lab.heatVision.update(1 / 30, true, head, camera, lab.world, city.destruction); lab.world.step() }
+      for (let i = 0; !building.damaged && i < 500; i++) {
+        assert(!destruction.carveJob?.error, `carving worker failed: ${destruction.carveJob?.error}`);
+        await new Promise(resolve => setTimeout(resolve, 10));
+        destruction.updateBurns(0);
+      }
       assert(building.damaged, 'eye beams never called city destruction');
       lab.heatVision.update(1 / 30, false, head, camera, lab.world, city.destruction);
       assert(!lab.heatVision.group.visible && city.destruction.previous.size === 0, 'releasing laser retained its stroke');

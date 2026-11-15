@@ -28,8 +28,7 @@ export function addHeroAppearance(parts: ReadonlyMap<string, HeroPart>, invalida
     roughnessMap: textures.skinDetail, clearcoat: .06, clearcoatRoughness: .7 })
   const skinShadow = skin.clone()
   skinShadow.color.set('#c99281')
-  const hair = material('#241e22', .64)
-  const hairLight = material('#3c2b29', .48)
+  const eyebrow = material('#241e22', .64)
   const white = new THREE.MeshPhysicalMaterial({ color: '#e6dfd4', roughness: .24, clearcoat: 1, clearcoatRoughness: .12 })
   const iris = material('#347caa', .32)
   const pupil = material('#111b28', .3)
@@ -150,9 +149,8 @@ export function addHeroAppearance(parts: ReadonlyMap<string, HeroPart>, invalida
       [sign * .103, .028, .150]], .0035, 'upper-eyelid')
     line('head', skin, [[sign * .043, .022, .153], [sign * .073, .014, .156],
       [sign * .102, .023, .149]], .003, 'lower-eyelid')
-    line('head', hair, [[sign * .025, .064, .153], [sign * .065, .072, .153],
+    line('head', eyebrow, [[sign * .025, .064, .153], [sign * .065, .072, .153],
       [sign * .112, .056, .143]], .006, 'eyebrow')
-    ellipsoid('head', hair, sign * .158, .045, -.026, .027, .092, .111, 'sideburn')
 
     // Anatomical masses overlap the joint sockets while keeping the elbow,
     // wrist, knee and ankle pivots free to bend through their physical limits.
@@ -241,19 +239,5 @@ export function addHeroAppearance(parts: ReadonlyMap<string, HeroPart>, invalida
     [.016, -.091, .161], [.044, -.092, .151]], .0025, 'lip-line')
   const lowerLip = skin.clone(); lowerLip.color.set('#dba39b')
   ellipsoid('head', lowerLip, 0, -.101, .155, .033, .006, .009, 'lower-lip')
-  const scalp = new THREE.SphereGeometry(1, 32, 20, 0, Math.PI * 2, 0, Math.PI * .58)
-  scalp.scale(.187, .166, .179)
-  add('head', scalp, hair, 0, .083, -.024, 'sculpted-hair')
-  ellipsoid('head', hair, .005, .192, .101, .089, .058, .065, 'quiff-volume')
-  // Swept locks and the characteristic curl are true 3D geometry in all views.
-  for (let i = 0; i < 6; i++) {
-    const x = -.139 + i * .049
-    line('head', i % 2 ? hairLight : hair, [[x, .105, .116], [x - .018, .181, .100],
-      [x + .023, .233, .022], [x + .065, .198, -.094], [x + .035, .13, -.16]], .025, 'swept-hair-lock')
-  }
-  line('head', hair, [[-.113, .171, .112], [-.045, .239, .116], [.042, .254, .095],
-    [.084, .210, .147], [.059, .143, .176], [.015, .126, .176], [.002, .153, .179]], .027, 'forehead-curl')
-  line('head', hairLight, [[-.105, .183, .134], [-.039, .244, .136], [.039, .251, .121],
-    [.069, .206, .166]], .005, 'curl-highlight')
   return dispose
 }

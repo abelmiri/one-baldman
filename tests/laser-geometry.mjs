@@ -1,7 +1,7 @@
 // Run: node --experimental-strip-types tests/laser-geometry.mjs
 import assert from 'node:assert/strict'
 import * as THREE from 'three'
-import { laserPlanes, laserSolid, solidGeometry, solidsTouch, subtractLaser, translatedSolid } from '../src/LaserGeometry.ts'
+import { connectedGroups, laserPlanes, laserSolid, solidGeometry, solidsTouch, subtractLaser, translatedSolid } from '../src/LaserGeometry.ts'
 
 const box = new THREE.BoxGeometry(4, 4, 4)
 const source = laserSolid(box, new THREE.Matrix4(), new THREE.Color('#b97b59'))
@@ -31,11 +31,39 @@ const oblique = subtractLaser(rotated, laserPlanes(rotatedCenter.clone().addScal
 assert(oblique.every(cell => cell.planes.some(plane => plane.distanceToPoint(rotatedCenter) >= -1e-5)), 'oblique cut missed a rotated structure')
 
 let cells = [source]
-for (let x = -2.16; x <= 2.2; x += .24) cells = cells.flatMap(cell => subtractLaser(cell,
-  laserPlanes(new THREE.Vector3(x, 0, -3), new THREE.Vector3(0, 0, 1), .22)))
+const connections = new Map()
+connectedGroups(cells, connections)
+for (let x = -2.16; x <= 2.2; x += .24) {
+  cells = cells.flatMap(cell => subtractLaser(cell,
+    laserPlanes(new THREE.Vector3(x, 0, -3), new THREE.Vector3(0, 0, 1), .22)))
+  connectedGroups(cells, connections)
+}
 const below = cells.filter(cell => cell.bounds.max.y < 0), above = cells.filter(cell => cell.bounds.min.y > 0)
 assert(below.length && above.length && below.length + above.length === cells.length, 'completed cut did not split the source')
 assert(below.every(a => above.every(b => !solidsTouch(a, b))), 'cut faces remain connected')
+assert.equal(connectedGroups(cells, connections).length, 2, 'cached contact graph kept a severed bridge')
+assert.equal(connections.size, cells.length, 'contact graph retained removed cells')
+const left = translatedSolid(source, new THREE.Vector3(-4, 0, 0))
+const right = translatedSolid(source, new THREE.Vector3(4, 0, 0))
+const alternate = translatedSolid(source, new THREE.Vector3(0, 4, 0))
+const bridge = new Map()
+assert.equal(connectedGroups([left, source, right, alternate], bridge).length, 1)
+assert.equal(connectedGroups([left, right, alternate], bridge).length, 1, 'alternate attachment was lost when a bridge was removed')
+assert.equal(connectedGroups([left, right], bridge).length, 2, 'removed bridge left stale contacts')
+assert.equal(connectedGroups([left, right, source], bridge).length, 1, 'new cells did not restore contact')
+assert.equal(connectedGroups([], bridge).length, 0)
+assert.equal(bridge.size, 0)
+
+const reflected = laserSolid(box, new THREE.Matrix4().makeScale(-2, 1, 1), new THREE.Color('blue'))
+assert(Math.abs(reflected.volume - 128) < 1e-8)
+assert(reflected.planes.every(plane => plane.distanceToPoint(new THREE.Vector3()) < 0), 'cached hull winding broke under reflection')
+const editedBox = box.clone()
+laserSolid(editedBox, new THREE.Matrix4(), new THREE.Color('red'))
+editedBox.scale(2, 1, 1)
+const edited = laserSolid(editedBox, new THREE.Matrix4(), new THREE.Color('green'))
+assert(Math.abs(edited.volume - 128) < 1e-8, 'source geometry edits did not invalidate the cached hull')
+assert(edited.faces.every(face => face.color.equals(new THREE.Color('green'))), 'cached hull leaked instance colors')
+editedBox.dispose()
 const offset = new THREE.Vector3(100, 20, -50)
 const shifted = translatedSolid(source, offset)
 assert(source.bounds.getCenter(new THREE.Vector3()).length() < 1e-8, 'translation mutated shared source vertices')

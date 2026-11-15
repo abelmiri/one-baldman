@@ -25,6 +25,7 @@ type AngularJoint = {
 }
 const v = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z)
 const STAND_HEIGHT = 1.23
+const MAX_STEP_HEIGHT = .4
 const RUN_SPEED = 6.40332
 const FLIGHT_BOOST_DURATION = 3.5
 const FLIGHT_BOOST_RELEASE_DURATION = .65
@@ -42,6 +43,8 @@ const CAPE_PROXY_GROUPS = 0x00080002
 const COLLAR_PROXY_GROUPS = 0x00100002
 
 type ImpactHandler = (point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void
+type ContactHandler = (collider: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like) => void
+type FlightContactHandler = (collider: RAPIER.Collider, from: THREE.Vector3Like, to: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void
 
 /** Animated kinematic character; switches to a dynamic ragdoll on impact or X. */
 export class Ragdoll {
@@ -55,6 +58,15 @@ export class Ragdoll {
   private hinges = new Map<string, RAPIER.RevoluteImpulseJoint>()
   private poseActive: boolean | null = null
   private released = false
+  private collisionProtected = false
+  private heldSupportHeight: number | null = null
+  private breakingFlight = false
+  private flightContact?: FlightContactHandler
+  private buildingCollider?: (collider: RAPIER.Collider) => boolean
+  private flightSweepShape = new RAPIER.Ball(1.15)
+  private flightSweepHits = new Set<number>()
+  private flightFrom = new THREE.Vector3()
+  private flightTo = new THREE.Vector3()
   private recovery: { style: GetUpStyle; age: number; duration: number; height: number; rotation: THREE.Quaternion } | null = null
   private direction = new THREE.Vector3()
   private moveVelocity = new THREE.Vector3()
@@ -285,13 +297,14 @@ export class Ragdoll {
 
   setFlight(held: boolean, pitch: number, bank: number, groundHeight: number, descending = false) {
     const controlled = this.standing && !this.released && !this.recovery
+    if (controlled && (held || descending)) this.heldSupportHeight = null
     this.ascentHeld = held && controlled
     this.descending = descending && controlled
     // Taking off latches flight; releasing Space holds altitude until C is held.
     this.flightHeld = controlled && (held || (this.airborne && !this.falling)) && !this.descending
     this.flightPitch = pitch
     this.flightBank = bank
-    this.groundHeight = groundHeight
+    this.groundHeight = Math.max(groundHeight, this.heldSupportHeight ?? -Infinity)
     if (this.ascentHeld && !this.airborne) {
       this.airborne = true
       this.flightAge = 0
@@ -323,7 +336,19 @@ export class Ragdoll {
   }
 
   get isReleased() { return this.released }
+  get isBreakingFlight() { return this.breakingFlight }
+  copyFlightSegment(from: THREE.Vector3, to: THREE.Vector3) {
+    if (!this.breakingFlight) return false
+    from.copy(this.flightFrom); to.copy(this.flightTo)
+    return true
+  }
+  configureFlightDestruction(contact: FlightContactHandler, filter: (collider: RAPIER.Collider) => boolean) {
+    this.flightContact = contact; this.buildingCollider = filter
+  }
+  get isCollisionProtected() { return this.collisionProtected }
   get isRecovering() { return this.recovery !== null }
+
+  setCollisionProtection(enabled: boolean) { this.collisionProtected = enabled && !this.released }
   get altitude() {
     return Math.max(0, this.parts.get('pelvis')!.body.translation().y - STAND_HEIGHT)
   }
@@ -346,8 +371,14 @@ export class Ragdoll {
     return target.set(this.supportTarget.x, this.supportTarget.y + .17 - this.sitBlend * .45, this.supportTarget.z)
   }
 
-  release() {
+  release(preserveHeight = false) {
     if (this.released) return
+    const pelvis = this.parts.get('pelvis')!.body
+    const position = pelvis.translation()
+    const height = position.y
+    const support = preserveHeight ? this.groundBelow(new THREE.Vector3().copy(position), height + .1) : 0
+    this.collisionProtected = false
+    this.breakingFlight = false
     this.recovery = null
     this.setStanding(false)
     this.released = true
@@ -357,11 +388,17 @@ export class Ragdoll {
     this.sitBlend = 0
     this.seatVisible = this.seat.visible = false
     this.setSeatCollision(false)
+    if (preserveHeight && height - support < 1.6) {
+      this.heldSupportHeight = support
+      pelvis.setEnabledTranslations(true, false, true, true)
+      const velocity = pelvis.linvel()
+      pelvis.setLinvel(v(velocity.x, 0, velocity.z), true)
+    }
     // Keep the current momentum, but remove any remaining balance torque immediately.
     this.parts.forEach(({ body }) => body.resetTorques(true))
   }
 
-  regainControl() {
+  regainControl(preserveHeight = false) {
     if (!this.released) return
     const pelvis = this.parts.get('pelvis')!.body
     const chest = this.parts.get('chest')!.body
@@ -378,13 +415,20 @@ export class Ragdoll {
         if (hit.normal.y > .65) distance = Math.min(distance, hit.timeOfImpact)
         return true
       }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, this.isGroundCollider)
-    const ground = Number.isFinite(distance) ? position.y + .1 - distance : this.groundHeight
+    const physicalGround = Number.isFinite(distance) ? position.y + .1 - distance : this.groundHeight
+    if (preserveHeight && this.heldSupportHeight === null
+      && Number.isFinite(distance) && position.y - physicalGround < 1.6) {
+      this.heldSupportHeight = physicalGround
+    }
+    const ground = Math.max(physicalGround,
+      this.heldSupportHeight ?? -Infinity)
     this.groundHeight = ground
-    const grounded = Number.isFinite(distance) && position.y - ground < 1.6
+    const grounded = (Number.isFinite(distance) || this.heldSupportHeight !== null) && position.y - ground < 1.6
     if (Math.hypot(forward.x, forward.z) > .3) this.heading = Math.atan2(forward.x, forward.z)
     const style: GetUpStyle = Math.abs(side.y) > Math.abs(forward.y)
       ? (side.y < 0 ? 'left' : 'right') : (forward.y < 0 ? 'front' : 'back')
     this.released = false
+    pelvis.setEnabledTranslations(true, true, true, true)
     this.setStanding(true, true)
     if (grounded) {
       this.recovery = { style, age: 0, duration: style === 'back' ? 3 : 2.6,
@@ -393,6 +437,7 @@ export class Ragdoll {
     } else {
       // Catch the body where it is, preserving travel and altitude in midair.
       this.airborne = true
+      this.falling = true
       this.flightAge = 1
       this.moveVelocity.copy(momentum).setY(0)
       this.verticalVelocity = momentum.y
@@ -416,6 +461,8 @@ export class Ragdoll {
     this.applyHeadPose()
     if (t === 1) {
       this.recovery = null
+      this.heldSupportHeight = null
+      this.groundHeight = this.groundBelow(this.supportTarget, this.supportTarget.y + .1)
       this.standHeight = this.groundHeight + STAND_HEIGHT - .04
       this.animation.resetFeet()
     }
@@ -440,7 +487,8 @@ export class Ragdoll {
     this.position.copy(this.direction).setY(0).multiplyScalar(travel)
     this.moveVelocity.lerp(this.position, 1 - Math.exp(-8 * dt))
     this.supportTarget.addScaledVector(this.moveVelocity, dt)
-    this.groundHeight = this.groundBelow(this.supportTarget, this.supportTarget.y + .1)
+    const breaking = !!this.flightContact && !this.falling && Math.hypot(this.moveVelocity.length(), this.verticalVelocity) * 3.6 > 200
+    this.groundHeight = this.groundBelow(this.supportTarget, this.supportTarget.y + .1, undefined, 500, breaking)
     const landing = this.groundHeight + STAND_HEIGHT - .04
     const clearance = Math.max(0, this.supportTarget.y - landing)
     const launch = this.flightHeld ? Math.sin(Math.PI * THREE.MathUtils.clamp(this.flightAge / .65, 0, 1)) : 0
@@ -581,7 +629,7 @@ export class Ragdoll {
     return this.groundBelow(position, this.groundHeight + .55, normal, 1.1)
   }
 
-  private groundBelow(position: THREE.Vector3, ceiling: number, normal?: THREE.Vector3, distance = 500) {
+  private groundBelow(position: THREE.Vector3, ceiling: number, normal?: THREE.Vector3, distance = 500, ignoreBuildings = false) {
     this.groundRay.origin.x = position.x
     this.groundRay.origin.y = ceiling
     this.groundRay.origin.z = position.z
@@ -594,8 +642,8 @@ export class Ragdoll {
         normal?.copy(hit.normal)
       }
       return true
-    }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, this.isGroundCollider)
-    return Number.isFinite(nearest) ? ceiling - nearest : this.groundHeight
+    }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, ignoreBuildings ? this.isFlightGroundCollider : this.isGroundCollider)
+    return Math.max(Number.isFinite(nearest) ? ceiling - nearest : this.groundHeight, this.heldSupportHeight ?? -Infinity)
   }
 
   private isGroundCollider = (collider: RAPIER.Collider) => {
@@ -603,6 +651,7 @@ export class Ragdoll {
     const parent = collider.parent()
     return !parent || (!this.ownBodies.has(parent.handle) && parent.handle !== this.seatBody.handle)
   }
+  private isFlightGroundCollider = (collider: RAPIER.Collider) => this.isGroundCollider(collider) && !this.buildingCollider?.(collider)
 
   private setSeatCollision(enabled: boolean) {
     if (enabled === this.seatColliding) return
@@ -718,6 +767,10 @@ export class Ragdoll {
   }
 
   setStanding(enabled: boolean, preserveHeight = false) {
+    if (!enabled && this.heldSupportHeight !== null) {
+      this.heldSupportHeight = null
+      this.parts.get('pelvis')!.body.setEnabledTranslations(true, true, true, true)
+    }
     if (this.released && enabled) return
     if (enabled === this.standing) return
     this.standing = enabled
@@ -860,6 +913,23 @@ export class Ragdoll {
       && Math.abs(this.groundRay.origin.y - hit.timeOfImpact - this.groundHeight) < .08
   }
 
+  private isLowerLeg(id: string) { return id.endsWith('Foot') || id.endsWith('Ankle') || id.endsWith('Shin') }
+
+  private isWalkableStep(surface: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like) {
+    if (!this.standing || this.released || this.airborne) return false
+    // A low contact alone is not enough: a tall wall can also touch a boot.
+    // Confirm a reachable upward-facing top just inside the contacted surface.
+    const base = this.groundHeight
+    if (point.y > base + MAX_STEP_HEIGHT + .03) return false
+    const parent = surface.parent()
+    if (parent && !parent.isFixed()) return false
+    this.groundRay.origin.x = point.x - normal.x * .03
+    this.groundRay.origin.y = base + MAX_STEP_HEIGHT + .03
+    this.groundRay.origin.z = point.z - normal.z * .03
+    const hit = surface.castRayAndGetNormal(this.groundRay, MAX_STEP_HEIGHT + .13, false)
+    return !!hit && hit.normal.y > .65
+  }
+
   private sweepForImpact(dt: number) {
     for (const [id, { body, targetPosition }] of this.parts) {
       this.velocity.copy(targetPosition).sub(body.translation()).divideScalar(dt)
@@ -870,13 +940,15 @@ export class Ragdoll {
           collider.shape, 0, dt, false, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS,
           undefined, undefined, undefined, other => {
             if (!this.isGroundCollider(other)) return false
+            if (this.breakingFlight && this.buildingCollider?.(other)) return false
             if (id.endsWith('Foot') && this.isFootSupport(other, collider)) return false
             // An initially penetrating sole can give a degenerate sweep normal.
             // Use its existing contact normal to exclude ordinary support first.
             const contact = other.contactCollider(collider, .01)
             return !contact || !this.isSupportContact(contact.normal1)
           })
-        if (hit && !this.isSupportContact(hit.normal1)) {
+        if (hit && !this.isSupportContact(hit.normal1)
+          && !(this.isLowerLeg(id) && this.isWalkableStep(hit.collider, hit.witness1, hit.normal1))) {
           this.contactNormal.copy(hit.normal1)
           this.impactVelocity.copy(this.velocity)
           const obstacle = hit.collider.parent()
@@ -889,9 +961,47 @@ export class Ragdoll {
     return false
   }
 
+  private sweepForDestructiveContacts(dt: number, onContact: ContactHandler, filter: (collider: RAPIER.Collider) => boolean) {
+    for (const [id, { body, targetPosition }] of this.parts) {
+      this.velocity.copy(targetPosition).sub(body.translation()).divideScalar(dt)
+      if (this.velocity.lengthSq() < 1e-6) continue
+      for (let i = 0; i < body.numColliders(); i++) {
+        const collider = body.collider(i)
+        const hit = this.world.castShape(collider.translation(), collider.rotation(), this.velocity,
+          collider.shape, 0, dt, true, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS,
+          undefined, undefined, undefined, other => this.isGroundCollider(other) && filter(other))
+        if (hit && !this.isSupportContact(hit.normal1)
+          && !(id.endsWith('Foot') && this.isFootSupport(hit.collider, collider))
+          && !(this.isLowerLeg(id) && this.isWalkableStep(hit.collider, hit.witness1, hit.normal1))) {
+          onContact(hit.collider, hit.witness1, hit.normal1)
+        }
+      }
+    }
+  }
+
+  private sweepForFlightDestruction(dt: number) {
+    const pelvis = this.parts.get('pelvis')!
+    const from = pelvis.body.translation(), to = pelvis.targetPosition
+    this.velocity.copy(to).sub(from).divideScalar(dt)
+    const speed = this.velocity.length()
+    this.breakingFlight = !!this.flightContact && this.airborne && !this.falling && !this.recovery && speed * 3.6 > 200
+    if (!this.breakingFlight) return
+    this.flightFrom.copy(from); this.flightTo.copy(to)
+    this.flightSweepHits.clear()
+    // Sweep the body's envelope once per surface, catching thin walls at boost speed.
+    for (let i = 0; i < 12; i++) {
+      const hit = this.world.castShape(from, pelvis.body.rotation(), this.velocity, this.flightSweepShape,
+        0, dt, true, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined,
+        collider => !this.flightSweepHits.has(collider.handle) && !!this.buildingCollider?.(collider))
+      if (!hit) break
+      this.flightSweepHits.add(hit.collider.handle)
+      this.flightContact!(hit.collider, from, to, hit.normal1, speed)
+    }
+  }
+
   // Run after world.step as well: a moving car can hit an idle character.
-  checkForImpact() {
-    const canRelease = this.standing && !this.released && !this.recovery
+  checkForImpact(onContact?: ContactHandler) {
+    const canRelease = this.standing && !this.released && !this.recovery && !this.collisionProtected
     let impact = false
     let strongest = 0
     this.supported = false
@@ -900,17 +1010,27 @@ export class Ragdoll {
         const collider = body.collider(i)
         this.world.contactPairsWith(collider, other => {
           if (!this.isGroundCollider(other)) return
+          if (this.breakingFlight && this.buildingCollider?.(other)) return
           const footSupport = id.endsWith('Foot') && this.isFootSupport(other, collider)
           this.world.contactPair(collider, other, (manifold, flipped) => {
             this.contactNormal.copy(manifold.normal()).multiplyScalar(flipped ? 1 : -1)
             for (let j = 0; j < manifold.numContacts(); j++) {
               if (manifold.contactDist(j) > .01) continue
               if (this.contactNormal.y > .5) this.supported = true
-              if (canRelease && !footSupport && !this.isSupportContact(this.contactNormal)
-                && manifold.contactDist(j) <= .001) impact = true
               const local = flipped ? manifold.localContactPoint2(j) : manifold.localContactPoint1(j)
               if (!local) continue
               this.contactPoint.copy(local).applyQuaternion(this.q1.copy(collider.rotation())).add(collider.translation())
+              const walkable = footSupport || this.isSupportContact(this.contactNormal)
+                || (this.isLowerLeg(id) && this.isWalkableStep(other, this.contactPoint, this.contactNormal))
+              if (walkable) continue
+              if (canRelease && manifold.contactDist(j) <= .001) impact = true
+              if (onContact && manifold.contactDist(j) <= .001) {
+                const surface = flipped ? manifold.localContactPoint1(j) : manifold.localContactPoint2(j)
+                if (surface) {
+                  const point = new THREE.Vector3().copy(surface).applyQuaternion(new THREE.Quaternion().copy(other.rotation())).add(other.translation())
+                  onContact(other, point, this.contactNormal)
+                }
+              }
               this.impactVelocity.copy(previousVelocity)
               const obstacle = other.parent()
               if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(this.contactPoint))
@@ -1053,7 +1173,8 @@ export class Ragdoll {
     }
   }
 
-  step(dt: number) {
+  step(dt: number, onContact?: ContactHandler, contactFilter?: (collider: RAPIER.Collider) => boolean) {
+    this.breakingFlight = false
     this.impactTime += dt
     this.parts.forEach(({ body, previousPosition, previousRotation, previousVelocity }) => {
       previousPosition.copy(body.translation())
@@ -1067,10 +1188,13 @@ export class Ragdoll {
     this.updatePose(dt)
     if (this.standing) {
       this.animateBodies()
+      this.sweepForFlightDestruction(dt)
+      // Get-up animation moves kinematic limbs too; catch thin scenery crossed between poses.
+      if (onContact && contactFilter) this.sweepForDestructiveContacts(dt, onContact, contactFilter)
       this.parts.forEach(({ body, targetPosition, previousVelocity }) => {
         previousVelocity.copy(targetPosition).sub(body.translation()).divideScalar(dt)
       })
-      if (!this.recovery && this.sweepForImpact(dt)) this.release()
+      if (!this.recovery && !this.collisionProtected && this.sweepForImpact(dt)) this.release()
       else {
         for (const { body, targetPosition, targetRotation } of this.parts.values()) {
           body.setNextKinematicTranslation(targetPosition)

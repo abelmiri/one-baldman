@@ -2,12 +2,16 @@ import * as THREE from 'three'
 import RAPIER from '@dimforge/rapier3d'
 import { CityTextures, type CitySurface } from './CityTextures'
 import { LaserDestruction, type Destructible, type DestructiblePart } from './LaserDestruction'
+import { buildingShell, type ShellCell } from './BuildingShell'
+import { CameraOcclusion } from './CameraOcclusion'
 
 type Shape = 'box' | 'sphere' | 'rock' | 'cylinder' | 'cone' | 'roof' | 'dome'
-type Instance = DestructiblePart & { surface: CitySurface | null }
+type Instance = DestructiblePart & { surface: CitySurface | null; buildingOwner?: Destructible }
+type BuildingBounds = { origin: THREE.Vector3; inverseRotation: THREE.Quaternion; bounds: THREE.Box3 }
 type Obstacle = { center: THREE.Vector3; half: THREE.Vector3; rotation: THREE.Quaternion; inverse: THREE.Quaternion; shape: RAPIER.Shape; landing: boolean; order: number; owner?: Destructible }
 const CELL_SIZE = 12
 const RENDER_CELL_SIZE = 64
+export const CITY_SCALE = 2.25
 const cellKey = (x: number, z: number) => (x + 1024) * 2048 + z + 1024
 const C = {
   grass: '#64883b', lawn: '#719742', hedge: '#365e30', leaf: '#40752f', lime: '#729e35',
@@ -21,6 +25,9 @@ export class City {
   readonly destruction: LaserDestruction
   private structureOwner?: Destructible
   private batches = new Map<Shape, Instance[]>()
+  private occlusion = new CameraOcclusion()
+  private occlusionFragments: THREE.Mesh[] = []
+  private buildingBounds = new WeakMap<Destructible, BuildingBounds>()
   private obstacles: Obstacle[] = []
   private obstacleCells = new Map<number, Obstacle[]>()
   private candidates: Obstacle[] = []
@@ -41,6 +48,7 @@ export class City {
   private textures: CityTextures
   private transform = new THREE.Matrix4()
   private randomState = 7319
+  private shellLayouts = new Map<string, ShellCell[]>()
   private water: THREE.ShaderMaterial
   private lamps: THREE.MeshStandardMaterial
   private glow = new THREE.MeshBasicMaterial({ color: '#ffc773', transparent: true, opacity: 0, depthWrite: false })
@@ -54,6 +62,7 @@ export class City {
     this.destruction = new LaserDestruction(this.root, dust)
     this.textures = new CityTextures(anisotropy, invalidate)
     this.root.name = 'Reference city'
+    this.transform.makeScale(CITY_SCALE, CITY_SCALE, CITY_SCALE)
     scene.add(this.root)
     this.water = new THREE.ShaderMaterial({
       uniforms: { time: { value: 0 }, night: { value: 0 } },
@@ -83,6 +92,12 @@ export class City {
     this.landscaping()
     this.streetFurniture()
     this.bridge()
+    // These standalone meshes and lights are built outside the instanced transform.
+    for (const object of this.root.children) {
+      object.position.multiplyScalar(CITY_SCALE)
+      object.scale.multiplyScalar(CITY_SCALE)
+      if (object instanceof THREE.PointLight) object.distance *= CITY_SCALE
+    }
     this.flush()
     this.createTraffic()
     const drops = new Float32Array(120 * 3)
@@ -110,12 +125,14 @@ export class City {
   }
 
   private put(shape: Shape, color: string, x: number, y: number, z: number,
-    sx: number, sy: number, sz: number, rotation = 0, surface: CitySurface | null = null) {
+    sx: number, sy: number, sz: number, rotation = 0, surface: CitySurface | null = null, cameraWall = false) {
     const matrix = new THREE.Matrix4().compose(new THREE.Vector3(x, y, z),
       new THREE.Quaternion().setFromAxisAngle(THREE.Object3D.DEFAULT_UP, rotation), new THREE.Vector3(sx, sy, sz))
     matrix.premultiply(this.transform)
     if (!this.batches.has(shape)) this.batches.set(shape, [])
-    const instance = { matrix, color: new THREE.Color(color), surface, geometry: this.geometries[shape] }
+    const buildingOwner = cameraWall && this.structureOwner?.kind === 'building' ? this.structureOwner : undefined
+    const instance = { matrix, color: new THREE.Color(color), surface, geometry: this.geometries[shape],
+      buildingOwner }
     this.batches.get(shape)!.push(instance)
     // Ground paths stay in the static city even when the structure above is cut.
     if (this.structureOwner && y + sy / 2 > .3) this.structureOwner.parts.push(instance)
@@ -139,13 +156,52 @@ export class City {
 
   private box(color: string, x: number, y: number, z: number, w: number, h: number, d: number,
     rotation = 0, surface = this.surfaceForColor(color)) {
+    if (this.isBuildingVolume(w, h, d)) {
+      const owner = this.structureOwner
+      if (owner && !this.buildingBounds.has(owner)) {
+        const parentPosition = new THREE.Vector3()
+        const parentRotation = new THREE.Quaternion()
+        this.transform.decompose(parentPosition, parentRotation, new THREE.Vector3())
+        const localRotation = new THREE.Quaternion().setFromAxisAngle(THREE.Object3D.DEFAULT_UP, rotation)
+        const center = new THREE.Vector3(x, y, z).applyMatrix4(this.transform)
+        const inverseRotation = parentRotation.multiply(localRotation).invert()
+        const wall = .24
+        const bounds = new THREE.Box3(
+          new THREE.Vector3(-w / 2 + wall, -h / 2 + .12, -d / 2 + wall).multiplyScalar(CITY_SCALE),
+          new THREE.Vector3(w / 2 - wall, h / 2 - .24, d / 2 - wall).multiplyScalar(CITY_SCALE))
+        this.buildingBounds.set(owner, { origin: center, inverseRotation, bounds })
+      }
+      const cosine = Math.cos(rotation), sine = Math.sin(rotation)
+      for (const cell of this.shellLayout(w, h, d, y - h / 2 > .1)) this.put('box',
+        cell.role === 'wall' ? color : cell.role === 'floor' ? '#a29782' : '#c8bea9',
+        x + cosine * cell.x + sine * cell.z, y + cell.y, z - sine * cell.x + cosine * cell.z,
+        cell.w, cell.h, cell.d, rotation, cell.role === 'wall' ? surface : null, cell.role === 'wall')
+      return
+    }
     this.put('box', color, x, y, z, w, h, d, rotation, surface)
   }
 
+  private isBuildingVolume(w: number, h: number, d: number) {
+    return this.structureOwner?.kind === 'building' && w >= 4 && d >= 4 && h >= 2
+  }
+
+  private shellLayout(w: number, h: number, d: number, includeBase: boolean) {
+    const key = `${w},${h},${d},${includeBase}`
+    let cells = this.shellLayouts.get(key)
+    if (!cells) { cells = buildingShell(w, h, d, includeBase); this.shellLayouts.set(key, cells) }
+    return cells
+  }
+
   private obstacle(x: number, y: number, z: number, w: number, h: number, d: number, landing = false, geometry: Shape = 'box') {
+    if (geometry === 'box' && this.isBuildingVolume(w, h, d)) {
+      for (const cell of this.shellLayout(w, h, d, y - h / 2 > .1)) this.obstacle(x + cell.x, y + cell.y, z + cell.z,
+        cell.w, cell.h, cell.d, cell.role === 'floor')
+      return
+    }
     const center = new THREE.Vector3(x, y, z).applyMatrix4(this.transform)
-    const rotation = new THREE.Quaternion().setFromRotationMatrix(this.transform)
-    const half = new THREE.Vector3(w / 2, h / 2, d / 2)
+    const rotation = new THREE.Quaternion()
+    this.transform.decompose(new THREE.Vector3(), rotation, new THREE.Vector3())
+    const half = new THREE.Vector3(w / 2, h / 2, d / 2).multiplyScalar(CITY_SCALE)
     let shape: RAPIER.Shape = new RAPIER.Cuboid(half.x, half.y, half.z)
     if (geometry !== 'box') {
       // Build the collider from the same vertices and scale as the visible roof.
@@ -153,7 +209,7 @@ export class City {
       const vertices = new Float32Array(source.count * 3)
       const bounds = new THREE.Box3()
       for (let i = 0; i < source.count; i++) {
-        const point = new THREE.Vector3(source.getX(i) * w, source.getY(i) * h, source.getZ(i) * d)
+        const point = new THREE.Vector3(source.getX(i) * w, source.getY(i) * h, source.getZ(i) * d).multiplyScalar(CITY_SCALE)
         point.toArray(vertices, i * 3)
         bounds.expandByPoint(point)
       }
@@ -170,7 +226,7 @@ export class City {
     const obstacle = { center, half, rotation, inverse: rotation.clone().invert(), shape, landing, order: this.obstacles.length, owner: this.structureOwner }
     this.obstacles.push(obstacle)
     // Insert the rotated footprint into every overlapped cell, including long walls.
-    const e = this.transform.elements
+    const e = new THREE.Matrix4().makeRotationFromQuaternion(rotation).elements
     const extentX = Math.abs(e[0]) * half.x + Math.abs(e[8]) * half.z
     const extentZ = Math.abs(e[2]) * half.x + Math.abs(e[10]) * half.z
     for (let xCell = Math.floor((center.x - extentX) / CELL_SIZE); xCell <= Math.floor((center.x + extentX) / CELL_SIZE); xCell++) {
@@ -346,17 +402,16 @@ export class City {
   }
 
   private window(x: number, y: number, z: number, w = 1, h = 1.6) {
-    this.box(C.trim, x, y, z, w + .24, h + .24, .16)
-    this.box(C.glass, x, y, z + .09, w, h, .08)
-    this.box('#a6bbba', x - w * .16, y + h * .07, z + .14, .08, h * .78, .025)
-    this.box(C.trim, x, y, z + .15, w + .04, .07, .04)
-    this.box(C.trim, x, y - h / 2 - .08, z + .15, w + .4, .16, .35)
+    this.put('box', C.trim, x, y, z, w + .24, h + .24, .16, 0, null, true)
+    this.put('box', C.glass, x, y, z + .09, w, h, .08, 0, null, true)
+    this.put('box', '#a6bbba', x - w * .16, y + h * .07, z + .14, .08, h * .78, .025, 0, null, true)
+    this.put('box', C.trim, x, y, z + .15, w + .04, .07, .04, 0, null, true)
+    this.put('box', C.trim, x, y - h / 2 - .08, z + .15, w + .4, .16, .35, 0, null, true)
   }
 
   private building(x: number, z: number, w: number, d: number, floors: number, color: string, shops = false) {
     this.structure('building', () => this.at(x, z, 0, () => {
       const h = floors * 2.9 + .6
-      this.box(C.stone, 0, .15, 0, w + .5, .5, d + .5)
       this.box(color, 0, h / 2, 0, w, h, d, 0, 'plaster')
       this.obstacle(0, h / 2, 0, w, h, d, true)
       for (let f = 0; f < floors; f++) {
@@ -409,7 +464,6 @@ export class City {
 
   private house(x: number, z: number, color: string, roof: string, angle = 0, yardDepth = 9.7) {
     this.structure('building', () => this.at(x, z, angle, () => {
-      this.box(C.trim, 0, .15, 0, 8.7, .4, 8.6)
       this.box(color, 0, 2.05, 0, 8, 4, 7.6, 0, 'plaster')
       this.obstacle(0, 2.05, 0, 8, 4, 7.6, true)
       this.put('roof', roof, 0, 5, 0, 9.4, 2.5, 9.2)
@@ -443,7 +497,8 @@ export class City {
     this.building(-66, -65, 15, 11, 4, '#b97b59')
     this.building(-59, -45, 14, 10, 3, '#ac7151')
     this.structure('building', () => this.at(6, -62, 0, () => {
-      this.box(C.path, 0, .02, 6, 31, .1, 29)
+      // Paving stays outside the hall; its interior shares the game terrain.
+      this.box(C.path, 0, .02, 15, 31, .1, 11)
       this.box('#c9b897', 0, 1, 0, 34, 2, 19)
       this.box('#d2b88c', 0, 5.2, 0, 30, 8.5, 17)
       this.obstacle(0, 1, 0, 34, 2, 19, true)
@@ -789,32 +844,63 @@ export class City {
         if (!chunks.has(key)) chunks.set(key, [])
         chunks.get(key)!.push(instance)
       }
-      for (const chunk of chunks.values()) {
+      for (const group of chunks.values()) {
         // Only box batches need per-instance surface data. Keep all materials
         // in the same draw, including untextured trim, glass, and road markings.
-        const textured = chunk.some(instance => instance.surface !== null)
-        const geometry = textured ? this.geometries[shape].clone() : this.geometries[shape]
+        const textured = group.some(instance => instance.surface !== null)
+        const occluders = group.some(instance => instance.buildingOwner)
+        const geometry = textured || occluders ? this.geometries[shape].clone() : this.geometries[shape]
         if (textured) {
-          const surfaces = new Float32Array(chunk.length * 3)
-          chunk.forEach((instance, i) => surfaces.set(this.textures.values(instance.surface), i * 3))
+          const surfaces = new Float32Array(group.length * 3)
+          group.forEach((instance, i) => surfaces.set(this.textures.values(instance.surface), i * 3))
           geometry.setAttribute('citySurface', new THREE.InstancedBufferAttribute(surfaces, 3))
         }
-        const mesh = new THREE.InstancedMesh(geometry, textured ? this.textures.material : this.material, chunk.length)
-        chunk.forEach((instance, i) => {
+        if (occluders) {
+          const attribute = new THREE.InstancedBufferAttribute(new Float32Array(group.length).fill(1), 1)
+          attribute.setUsage(THREE.DynamicDrawUsage)
+          geometry.setAttribute('cameraOpacity', attribute)
+          group.forEach((instance, index) => {
+            if (instance.buildingOwner) this.occlusion.register(instance.buildingOwner, instance, attribute, index)
+          })
+        }
+        const baseMaterial = textured ? this.textures.material : this.material
+        const material = occluders ? this.occlusion.material(baseMaterial) : baseMaterial
+        const mesh = new THREE.InstancedMesh(geometry, material, group.length)
+        group.forEach((instance, i) => {
           mesh.setMatrixAt(i, instance.matrix); mesh.setColorAt(i, instance.color)
           instance.mesh = mesh; instance.index = i
         })
         mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
         mesh.castShadow = mesh.receiveShadow = true
         mesh.computeBoundingSphere()
-        mesh.name = `City ${shape} (${chunk.length})`
+        mesh.name = `City ${shape} (${group.length})`
         target.add(mesh)
       }
     }
     this.batches.clear()
   }
 
+  buildingAt(position: THREE.Vector3) {
+    for (const owner of this.destruction.objects) {
+      if (owner.kind !== 'building') continue
+      const cached = this.buildingBounds.get(owner)
+      if (!cached) continue
+      const local = position.clone().sub(cached.origin).applyQuaternion(cached.inverseRotation)
+      const bounds = cached.bounds
+      if (local.x > bounds.min.x + .35 && local.x < bounds.max.x - .35
+        && local.z > bounds.min.z + .35 && local.z < bounds.max.z - .35
+        && local.y > bounds.min.y - .18 && local.y < bounds.max.y - .35) return owner
+    }
+    return null
+  }
+
+  updateOcclusion(camera: THREE.Camera, character: THREE.Vector3, delta: number, enabled = true) {
+    this.destruction.buildingMeshes(this.occlusionFragments)
+    return this.occlusion.update(camera, character, delta, this.occlusionFragments, enabled)
+  }
+
   dispose() {
+    this.occlusion.dispose()
     this.destruction.dispose()
     this.textures.dispose()
   }
@@ -828,10 +914,12 @@ export class City {
   }
 
   addColliders(world: RAPIER.World) {
+    this.occlusion.reset()
     this.destruction.reset(world)
     // One reusable static environment is attached to each new physics world.
     // Match the walkable pavement height so boots remain above the visible paths.
-    world.createCollider(RAPIER.ColliderDesc.cuboid(99, .12, 99).setTranslation(0, -.08, 0).setFriction(.85))
+    world.createCollider(RAPIER.ColliderDesc.cuboid(99 * CITY_SCALE, .12 * CITY_SCALE, 99 * CITY_SCALE)
+      .setTranslation(0, -.08 * CITY_SCALE, 0).setFriction(.85))
     for (const { center, shape, rotation, owner } of this.obstacles) {
       if (owner?.kind === 'tree') continue
       const collider = world.createCollider(new RAPIER.ColliderDesc(shape)
@@ -853,7 +941,8 @@ export class City {
     for (const car of this.traffic) {
       car.body = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased()
         .setTranslation(car.mesh.position.x, 0, car.mesh.position.z).setRotation(car.mesh.quaternion))
-      const collider = world.createCollider(RAPIER.ColliderDesc.cuboid(.95, .8, 2).setTranslation(0, .8, 0).setFriction(.6), car.body)
+      const collider = world.createCollider(RAPIER.ColliderDesc.cuboid(.95 * CITY_SCALE, .8 * CITY_SCALE, 2 * CITY_SCALE)
+        .setTranslation(0, .8 * CITY_SCALE, 0).setFriction(.6), car.body)
       this.destruction.register(car.owner, collider)
       car.owner.stop = () => {
         car.owner.velocity = car.body ? new THREE.Vector3().copy(car.body.linvel()) : new THREE.Vector3()
@@ -903,7 +992,7 @@ export class City {
   }
 
   groundHeightAt(position: THREE.Vector3) {
-    let height = .04
+    let height = .04 * CITY_SCALE
     this.supportRay.origin.x = position.x
     this.supportRay.origin.y = position.y
     this.supportRay.origin.z = position.z
@@ -937,6 +1026,7 @@ export class City {
     const tangent = this.route.getTangentAt(t, this.routeTangent).multiplyScalar(car.speed)
     point.x -= tangent.z * 1.85
     point.z += tangent.x * 1.85
+    point.multiplyScalar(CITY_SCALE)
     return Math.atan2(tangent.x, tangent.z)
   }
 
@@ -962,7 +1052,8 @@ export class City {
       const positions = this.jets.geometry.getAttribute('position') as THREE.BufferAttribute
       for (let i = 0; i < positions.count; i++) {
         const t = (time * .7 + i / positions.count) % 1, a = i * 2.39996
-        positions.setXYZ(i, 6 + Math.cos(a) * t * 1.3, .7 + Math.sin(t * Math.PI) * 2.6, -41.5 + Math.sin(a) * t * 1.3)
+        positions.setXYZ(i, (6 + Math.cos(a) * t * 1.3) * CITY_SCALE,
+          (.7 + Math.sin(t * Math.PI) * 2.6) * CITY_SCALE, (-41.5 + Math.sin(a) * t * 1.3) * CITY_SCALE)
       }
       positions.needsUpdate = true
     }
