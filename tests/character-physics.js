@@ -20,9 +20,9 @@ async page => {
       const world = new R.World({ x: 0, y: -9.8, z: 0 });
       world.createCollider(R.ColliderDesc.cuboid(100, .1, 100).setTranslation(0, -.06, 0));
       const character = new Ragdoll(world, new T.Scene(), 0, true);
-      const step = (flight = false, forward = 0, running = false, descend = false) => {
+      const step = (flight = false, forward = 0, running = false, descend = false, lateral = 0) => {
         character.setFlight(flight, 0, 0, .04, descend);
-        character.setMovement(0, forward, running, false);
+        character.setMovement(lateral, forward, running, false);
         character.step(1 / 60);
         world.step();
         character.checkForImpact();
@@ -72,6 +72,34 @@ async page => {
         assert(f.character.flightState === 'grounded', 'controlled landing triggered ragdoll');
         results.control = { walkSpeed, runSpeed, flight: true, releaseKeepsMomentum: true, recovery: true, landing: true };
       } finally { f.dispose() }
+
+      const directions = [];
+      for (const heading of [0, 1.2]) for (const running of [false, true]) {
+        const f = fixture();
+        try {
+          const facing = new T.Quaternion().setFromAxisAngle(T.Object3D.DEFAULT_UP, heading);
+          f.character.setFlightAim(new T.Vector3(0, 0, 1).applyQuaternion(facing), 0);
+          for (const [name, x, z] of [['forward', 0, 1], ['backward', 0, -1], ['left', 1, 0], ['right', -1, 0], ['diagonal', .707, -.707]]) {
+            const direction = new T.Vector3(x, 0, z).normalize().applyQuaternion(facing);
+            const previous = new T.Vector3().copy(f.character.parts.get('pelvis').body.translation());
+            let steps = 0;
+            for (let i = 0; i < 180; i++) {
+              const swinging = f.character.animation.feet.map(foot => foot.swinging);
+              f.step(false, direction.z, running, false, direction.x);
+              steps += f.character.animation.feet.filter((foot, side) => foot.swinging && !swinging[side]).length;
+              assert(f.character.flightState === 'grounded', name + ' triggered falling or ragdoll');
+            }
+            const distance = new T.Vector3().copy(f.character.parts.get('pelvis').body.translation()).sub(previous).dot(direction);
+            assert(distance > (running ? 15 : 5), name + ' movement was blocked by facing alignment');
+            assert(Math.abs(f.character.viewHeading - heading) < .01, name + ' turned the body away from the view');
+            assert(steps >= 3, name + ' feet stopped stepping with physical contacts');
+            directions.push({name, heading, running, steps});
+          }
+          for (let i = 0; i < 180; i++) f.step();
+          assert(f.character.animation.feet.every(foot => !foot.swinging), 'directional movement did not settle');
+        } finally { f.dispose() }
+      }
+      results.directionalMovement = { passed: true, cases: directions.length };
 
       for (const flight of [false, true]) {
         const f = fixture();

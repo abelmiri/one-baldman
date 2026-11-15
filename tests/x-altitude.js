@@ -26,22 +26,28 @@ async page => {
       const pelvis = hero.parts.get('pelvis').body;
       const height = pelvis.translation().y;
       assert(height > 7 && height < 7.5, 'fixture landed at street height');
-      hero.release(true);
+      hero.release();
       assert(hero.isReleased && pelvis.isDynamic(), 'manual X did not retain physical body behavior');
       assert(Math.abs(pelvis.translation().y - height) < 1e-6, 'manual X teleported the character');
       for (let i = 0; i < 120; i++) step();
-      assert(Math.abs(pelvis.translation().y - height) < 1e-3, 'released character fell from its X altitude');
-      hero.regainControl(); hero.setCollisionProtection(true);
-      assert(hero.isRecovering, 'X did not get up at the held roof height');
+      assert(pelvis.translation().y < height - .15, 'manual X pinned the pelvis instead of letting the body collapse');
+      hero.regainControl(true); hero.setCollisionProtection(true);
+      assert(hero.isRecovering, 'X did not get up from the roof');
       let lowest = Infinity;
       for (let i = 0; i < 240; i++) { step(); lowest = Math.min(lowest, pelvis.translation().y) }
-      assert(lowest > 6 && Math.abs(pelvis.translation().y - height) < .1, 'getting up did not stay supported on the roof');
+      assert(lowest > 6 && Math.abs(pelvis.translation().y - height) < .1, 'getting up did not stay supported on the roof: ' + JSON.stringify({ lowest, height, current: pelvis.translation() }));
       assert(hero.flightState === 'grounded', 'roof support did not allow normal standing');
       const position = new T.Vector3().copy(pelvis.translation());
       for (let i = 0; i < 30; i++) step(false, 1);
       assert(pelvis.translation().z > position.z + .1 && Math.abs(pelvis.translation().y - height) < .1, 'movement lost rooftop support');
+      hero.release();
+      const unsupportedHeight = pelvis.translation().y;
       world.removeCollider(roof, true);
+      for (let i = 0; i < 30; i++) step();
+      assert(pelvis.translation().y < unsupportedHeight - .5, 'released pelvis stayed pinned after roof removal');
       for (let i = 0; i < 300; i++) step();
+      hero.regainControl(true); hero.setCollisionProtection(true);
+      for (let i = 0; i < 240; i++) step();
       assert(pelvis.translation().y < 1.5 && hero.flightState === 'grounded', 'character stayed at X altitude after losing support');
 
       const airborneOffset = new T.Vector3(0, 12 - pelvis.translation().y, 0);
@@ -53,7 +59,7 @@ async page => {
       hero.airborne = true;
       hero.flightAge = 1;
       const airborneHeight = pelvis.translation().y;
-      hero.release(true);
+      hero.release();
       for (let i = 0; i < 60; i++) step();
       assert(pelvis.translation().y < airborneHeight - 1, 'X held altitude instead of allowing a free fall in the sky');
       const regainHeight = pelvis.translation().y;
@@ -78,7 +84,7 @@ async page => {
       for (let i = 0; i < 360; i++) step();
       assert(crashHeight > 8 && pelvis.translation().y < 1.5 && hero.flightState === 'grounded',
         'X recovery from an ordinary crash remained at its starting altitude');
-      return { passed: true, roofHeight: height, releasedHeightHeld: true, getUpStaysOnRoof: true, roofRemovalFallsToGround: true, airborneCrashRecoveryFallsToGround: true, movement: true, ordinaryGravity: true };
+      return { passed: true, roofHeight: height, releasedBodyCollapses: true, getUpStaysOnRoof: true, releasedRoofRemovalFallsToGround: true, airborneCrashRecoveryFallsToGround: true, movement: true, ordinaryGravity: true };
     } finally { hero.dispose(); world.free() }
   });
 }

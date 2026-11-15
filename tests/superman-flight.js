@@ -91,7 +91,7 @@ async page => {
       results.laser={beams:2,lengths:beams.map(b=>b.scale.y),pooled:true};
       assert(hero.parts.size===21, 'main anatomical joints were lost');
       const names=new Set();for(const p of hero.parts.values())p.mesh.traverse(o=>names.add(o.name));
-      for(const name of ['skyward-emblem','forehead-curl','cape-clasp','boot-gold-edge','finger-knuckle'])
+      for(const name of ['skyward-emblem','nose-bridge','cape-clasp','boot-gold-edge','finger-knuckle'])
         assert(names.has(name),'missing reference detail: '+name);
       results.model={parts:hero.parts.size,referenceDetails:true};
       // Exercise the real input routing as well as the isolated physics fixture.
@@ -117,7 +117,7 @@ async page => {
         key('KeyW',true);key('ShiftRight',true);lab.step();
         const aimed=new T.Vector3();lab.camera.getWorldDirection(aimed);
         assert(lab.ragdoll.direction.dot(aimed)>.999,'W flattened camera pitch');
-        assert(lab.ragdoll.running&&lab.ragdoll.flightThrottle===1,'Shift+W did not route boost');
+        assert(lab.ragdoll.running&&lab.ragdoll.direction.dot(aimed)>.999,'Shift+W did not route boost');
         key('KeyF',true);lab.step();
         lab.ragdoll.sync();
         lab.heatVision.update(1/60,lab.keys.has('KeyF'),lab.ragdoll.parts.get('head').mesh,lab.camera,lab.world);

@@ -1,6 +1,7 @@
 // Run in the app: playwright-cli run-code --filename tests/cape-falling.js
 async page => {
   await page.reload();
+  await page.locator('.scene-canvas').waitFor();
   await page.locator('.game-loading').waitFor({ state: 'detached' });
   return page.evaluate(async () => {
     const T = await import('/node_modules/.vite/deps/three.js');
@@ -12,7 +13,7 @@ async page => {
     const lab = hook.memoizedState.current;
     const settings = { ...lab.settings };
     const assert = (condition, message) => { if (!condition) throw Error(message) };
-    const dt = 1 / 60, point = new T.Vector3(), parent = new T.Vector3();
+    const dt = lab.world.integrationParameters.dt, point = new T.Vector3(), parent = new T.Vector3();
     cancelAnimationFrame(lab.raf);
     try {
       lab.settings = { ...settings, mode: 'cape', standing: true, wind: 0, gravity: 9.8 };
@@ -57,13 +58,13 @@ async page => {
         }
         return height / count;
       };
-      for (let i = 0; i < 180; i++) step(0);
+      for (let i = 0; i < Math.round(3 / dt); i++) step(0);
       const restingHem = hemOffset();
       assert(restingHem < -1, 'stationary cape does not hang down');
-      for (let i = 0; i < 180; i++) step(-9.8 * (i + 1) * dt);
+      for (let i = 0; i < Math.round(3 / dt); i++) step(-9.8 * (i + 1) * dt);
       const fallingHem = hemOffset();
       assert(fallingHem > .2, 'cape did not rise above its collar during freefall: ' + fallingHem);
-      for (let i = 0; i < 300; i++) step(0);
+      for (let i = 0; i < Math.round(5 / dt); i++) step(0);
       const stoppedHem = hemOffset();
       assert(stoppedHem < -1, 'cape did not settle after the fall stopped: ' + stoppedHem);
       return { passed: true, restingHem, fallingHem, stoppedHem, maximumLengthRatio, collarAttached: true };

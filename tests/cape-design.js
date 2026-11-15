@@ -20,11 +20,13 @@ async page => {
       lab.updateMesh();
       const surface = lab.capeSurface;
       const attribute = surface.geometry.getAttribute('position');
-      const count = Math.sqrt(attribute.count);
+      const count = surface.count, columnCount = surface.columnCount;
+      assert(surface.geometry.index.count / 3 === 2 * (count - 1) ** 2 * 2,
+        'cape triangle count did not double');
       const settled = Array.from(attribute.array);
       assert(settled.every(Number.isFinite), 'non-finite calm cape surface');
       const particles = Math.sqrt(lab.cloth.numParticles());
-      const subdivisions = (count - 1) / (particles - 1);
+      const subdivisions = (columnCount - 1) / (particles - 1);
       assert(lab.cloth.numAttachments() === particles, 'collar lost an attachment');
       for (let column = 0; column < particles; column++) {
         const index = column * subdivisions * count * 3;
@@ -36,7 +38,7 @@ async page => {
       }
       // Even after ten seconds without wind, cross-sections retain folds.
       const row = Math.round((count - 1) * .7);
-      const depths = Array.from({ length: count }, (_, column) => attribute.getZ(column * count + row));
+      const depths = Array.from({ length: columnCount }, (_, column) => attribute.getZ(column * count + row));
       let turns = 0;
       for (let i = 1; i < depths.length - 1; i++) {
         if ((depths[i] - depths[i - 1]) * (depths[i + 1] - depths[i]) < 0) turns++;

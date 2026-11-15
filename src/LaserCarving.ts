@@ -1,5 +1,6 @@
 import * as THREE from 'three'
-import { connectedGroups, laserPlanes, solidGeometry, subtractLaser, translatedSolid, type LaserSolid, type SolidConnections } from './LaserGeometry'
+import { connectedGroups, laserPlanes, solidGeometry, subtractLaser, translatedSolid, type LaserSolid, type SolidConnections } from './LaserGeometry.ts'
+import { breakWeakBuildingConnections } from './BuildingSupport.ts'
 
 export type CarveInput = {
   solids: LaserSolid[]; shots: { point: THREE.Vector3; direction: THREE.Vector3; radius?: number; depth?: number }[]
@@ -45,6 +46,7 @@ export function carve(input: CarveInput): CarveOutput {
     solids = solids.flatMap(cell => subtractLaser(cell, planes))
   }
   const connections = input.connections ?? new Map<LaserSolid, Set<LaserSolid>>()
+  if (input.kind === 'building' && !input.moving) solids = breakWeakBuildingConnections(solids, connections)
   const groups = connectedGroups(solids, connections)
   const indices = new Map(solids.map((cell, i) => [cell, i]))
   const edges: number[] = []

@@ -83,7 +83,7 @@ export function laserSolid(geometry: THREE.BufferGeometry, matrix: THREE.Matrix4
   }), structural)!
 }
 
-function clip(source: LaserSolid, plane: THREE.Plane) {
+export function clipSolid(source: LaserSolid, plane: THREE.Plane, capColor = CHAR) {
   const faces: Face[] = [], cap: THREE.Vector3[] = []
   for (const face of source.faces) {
     const points: THREE.Vector3[] = []
@@ -100,7 +100,7 @@ function clip(source: LaserSolid, plane: THREE.Plane) {
     if (polygon.length >= 3) faces.push({ points: polygon, color: face.color })
   }
   const boundary = ordered(cap, plane.normal)
-  if (boundary.length >= 3) faces.push({ points: boundary, color: CHAR })
+  if (boundary.length >= 3) faces.push({ points: boundary, color: capColor })
   return solid(faces, source.structural)
 }
 
@@ -132,9 +132,9 @@ export function subtractLaser(source: LaserSolid, planes: THREE.Plane[]): LaserS
     if (!remainder) break
     const distances = remainder.vertices.map(p => plane.distanceToPoint(p))
     if (Math.max(...distances) <= EPS) continue
-    const outside = clip(remainder, plane.clone().negate())
+    const outside = clipSolid(remainder, plane.clone().negate())
     if (outside) result.push(outside)
-    remainder = clip(remainder, plane)
+    remainder = clipSolid(remainder, plane)
   }
   return result
 }

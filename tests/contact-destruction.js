@@ -26,7 +26,8 @@ async page => {
     };
     const geometry = new T.BoxGeometry(4, 4, 4);
     try {
-      for (const kind of ['building', 'tree', 'car']) {
+      // Trees/cars use speed-gated fragmentation, covered in prop-destruction.js.
+      for (const kind of ['building']) {
         const world = new R.World({ x: 0, y: -9.81, z: 0 });
         const d = new LaserDestruction(new T.Group());
         const owner = d.create(kind);
@@ -112,7 +113,8 @@ async page => {
         assert(!getUpCollider.isValid(), 'get-up contact left the original scenery collider intact');
         assert(owner.damaged, 'get-up contacts did not damage the nearby wall');
         assert(lab.impactDestructionUntil === null, 'get-up contact prematurely started the three-second timer');
-        for (let i = 0; i < 300 && lab.impactDestructionUntil === null; i++) lab.step();
+        const recoveryDeadline = lab.elapsed + 5;
+        while (lab.elapsed < recoveryDeadline && lab.impactDestructionUntil === null) lab.step();
         assert(lab.impactDestructionUntil !== null && lab.impactDestruction, 'standing up did not start the destructive contact window');
         assert(Math.abs(lab.impactDestructionUntil - lab.elapsed - 3) < 1e-6, 'destructive contact window is not three seconds');
         assert(lab.ragdoll.isCollisionProtected && !lab.ragdoll.isReleased && !lab.ragdoll.isRecovering, 'standing up did not preserve normal control and collision protection');
@@ -151,7 +153,7 @@ async page => {
           assert(lab.destructionContacts.length === 0, 'released body queued damage during the standing timer');
         }
         assert(floatingContacts > 0 && !floatingOwner.damaged && !d.burns.some(burn => burn.owner === floatingOwner), 'falling during the three-second window damaged scenery');
-        for (let i = 0; i < 164; i++) lab.step();
+        while (lab.elapsed + lab.world.timestep < lab.impactDestructionUntil - 1e-8) lab.step();
         assert(lab.impactDestruction, 'destructive contacts expired before three seconds');
         lab.step();
         assert(!lab.impactDestruction && lab.impactDestructionUntil === null, 'destructive contacts did not expire after three seconds');
@@ -165,7 +167,7 @@ async page => {
         if (protectedOwner) d.objects.splice(d.objects.indexOf(protectedOwner), 1);
         wallGeometry.dispose(); getUpGeometry.dispose();
       }
-      return { passed: true, kinds: ['building', 'tree', 'car'], localizedContactDamage: true, noLaserDelay: true, ragdollDoesNotDamage: true, duringGetUp: true, afterStandingSeconds: 3, protectedControl: true, releasedDuringTimerDoesNotDamage: true, reset: true };
+      return { passed: true, kinds: ['building'], localizedContactDamage: true, noLaserDelay: true, ragdollDoesNotDamage: true, duringGetUp: true, afterStandingSeconds: 3, protectedControl: true, releasedDuringTimerDoesNotDamage: true, reset: true };
     } finally {
       geometry.dispose(); lab.update(settings); lab.reset(); lab.previousTime = 0; lab.raf = requestAnimationFrame(lab.frame);
     }

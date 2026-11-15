@@ -44,11 +44,14 @@ async page => {
       assert(visible.intersectObject(group, true).length === 0, 'visual geometry did not open at the hit');
       results.hole = { visual: true, physics: true, staysSupported: true };
       const start = performance.now();
+      let firstReleaseX;
       for (let x = -2.16; x < 2.2; x += .24) {
         const collider = system.chunks.find(chunk => chunk.colliders.length)?.colliders[0];
         assert(collider, 'all material disappeared during the sweep');
         system.cut(collider, new T.Vector3(x, 2, -2), axis);
+        if (firstReleaseX === undefined && system.chunks.some(chunk => chunk.body)) firstReleaseX = x;
       }
+      assert(firstReleaseX !== undefined && firstReleaseX + .22 < 2, 'upper section waited for every narrow attachment to be cut');
       const top = system.chunks.filter(chunk => chunk.body);
       assert(top.length > 0, 'completed cut did not release an unsupported section');
       assert(system.chunks.some(chunk => !chunk.body), 'grounded foundation was released');
@@ -57,7 +60,7 @@ async page => {
       system.sync();
       assert(top.some((chunk, i) => chunk.body.translation().y < heights[i] - .3), 'detached section did not fall under gravity');
       assert(top.every(chunk => chunk.mesh.position.distanceTo(chunk.body.translation()) < 1e-6), 'debris rendering diverged from physics');
-      results.sweep = { detached: top.length, chunks: system.chunks.length, elapsedMs: performance.now() - start };
+      results.sweep = { detached: top.length, chunks: system.chunks.length, firstReleaseX, elapsedMs: performance.now() - start };
       // Repeated cuts on a moving fragment must transform the beam into its local frame.
       const moving = top.find(chunk => chunk.colliders.length);
       const localPoint = moving.solids[0].bounds.getCenter(new T.Vector3());
@@ -177,7 +180,8 @@ async page => {
         destruction.cut(chunk.colliders[0], new T.Vector3(x, 2.5, bounds.min.z - .1), axis);
       }
       const upper = destruction.chunks.filter(chunk => chunk.owner === building && chunk.body);
-      assert(upper.some(chunk => chunk.solids.reduce((sum, cell) => sum + cell.volume, 0) > 100), 'complete city building cut did not detach its upper floors');
+      assert(upper.length > 1 && upper.reduce((volume, chunk) => volume + chunk.solids.reduce((sum, cell) => sum + cell.volume, 0), 0) > 100,
+        'complete city building cut did not collapse its upper floors into independent debris');
       const upperHeights = upper.map(chunk => chunk.body.translation().y);
       for (let i = 0; i < 30; i++) lab.world.step();
       assert(upper.some((chunk, i) => chunk.body.translation().y < upperHeights[i] - .2), 'city building did not collapse after severing');

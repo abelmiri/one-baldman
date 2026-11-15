@@ -1,6 +1,7 @@
 // Run with the app open: playwright-cli run-code --filename tests/cape-forward-limit.js
 async page => {
   await page.reload();
+  await page.locator('.scene-canvas').waitFor();
   await page.locator('.game-loading').waitFor({ state: 'detached' });
   return page.evaluate(async () => {
     const T = await import('/node_modules/.vite/deps/three.js');
@@ -12,7 +13,7 @@ async page => {
     const lab = hook.memoizedState.current;
     const settings = { ...lab.settings };
     const assert = (condition, message) => { if (!condition) throw Error(message) };
-    const count = Math.sqrt(lab.cloth.numParticles()), dt = 1 / 60;
+    const count = Math.sqrt(lab.cloth.numParticles()), dt = lab.world.integrationParameters.dt;
     const point = new T.Vector3(), parent = new T.Vector3(), forward = new T.Vector3();
     const up = new T.Vector3(), velocity = new T.Vector3(), boundaryVelocity = new T.Vector3();
     const rotation = new T.Quaternion();
@@ -84,7 +85,7 @@ async page => {
         check(label);
       };
       const step = (label, frames) => {
-        for (let i = 0; i < frames; i++) {
+        for (let i = 0; i < Math.round(frames / (60 * dt)); i++) {
           lab.step();
           check(label);
           maximumSpeed = Math.max(maximumSpeed, lab.ragdoll.speed);

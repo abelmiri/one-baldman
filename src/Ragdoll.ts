@@ -43,7 +43,7 @@ const CAPE_PROXY_GROUPS = 0x00080002
 const COLLAR_PROXY_GROUPS = 0x00100002
 
 type ImpactHandler = (point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void
-type ContactHandler = (collider: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like) => void
+type ContactHandler = (collider: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void
 type FlightContactHandler = (collider: RAPIER.Collider, from: THREE.Vector3Like, to: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => void
 
 /** Animated kinematic character; switches to a dynamic ragdoll on impact or X. */
@@ -62,6 +62,7 @@ export class Ragdoll {
   private heldSupportHeight: number | null = null
   private breakingFlight = false
   private flightContact?: FlightContactHandler
+  private impactPassThrough?: (collider: RAPIER.Collider, speed: number) => boolean
   private buildingCollider?: (collider: RAPIER.Collider) => boolean
   private flightSweepShape = new RAPIER.Ball(1.15)
   private flightSweepHits = new Set<number>()
@@ -75,7 +76,6 @@ export class Ragdoll {
   private ascentHeld = false
   private descending = false
   private viewDirection = new THREE.Vector3(0, 0, 1)
-  private flightThrottle = 0
   private flightBoost = 0
   private aiming = false
   private airborne = false
@@ -100,6 +100,10 @@ export class Ragdoll {
   private groundRay = new RAPIER.Ray(v(0, 0, 0), v(0, -1, 0))
   private groundHeight = .04
   private flightRotation = new THREE.Quaternion()
+  private flightTravel = new THREE.Vector3()
+  private headAim = new THREE.Quaternion()
+  private headShare = new THREE.Quaternion()
+  private headEuler = new THREE.Euler(0, 0, 0, 'XYZ')
   private flightEuler = new THREE.Euler(0, 0, 0, 'YXZ')
   private sitting = false
   private sitBlend = 0
@@ -319,9 +323,8 @@ export class Ragdoll {
     if (this.ascentHeld) this.falling = false
   }
 
-  setFlightAim(direction: THREE.Vector3, forward: number, aiming = false) {
+  setFlightAim(direction: THREE.Vector3, _forward: number, aiming = false) {
     this.viewDirection.copy(direction).normalize()
-    this.flightThrottle = forward
     this.aiming = aiming
   }
 
@@ -344,6 +347,9 @@ export class Ragdoll {
   }
   configureFlightDestruction(contact: FlightContactHandler, filter: (collider: RAPIER.Collider) => boolean) {
     this.flightContact = contact; this.buildingCollider = filter
+  }
+  configureImpactPassThrough(filter: (collider: RAPIER.Collider, speed: number) => boolean) {
+    this.impactPassThrough = filter
   }
   get isCollisionProtected() { return this.collisionProtected }
   get isRecovering() { return this.recovery !== null }
@@ -371,12 +377,8 @@ export class Ragdoll {
     return target.set(this.supportTarget.x, this.supportTarget.y + .17 - this.sitBlend * .45, this.supportTarget.z)
   }
 
-  release(preserveHeight = false) {
+  release() {
     if (this.released) return
-    const pelvis = this.parts.get('pelvis')!.body
-    const position = pelvis.translation()
-    const height = position.y
-    const support = preserveHeight ? this.groundBelow(new THREE.Vector3().copy(position), height + .1) : 0
     this.collisionProtected = false
     this.breakingFlight = false
     this.recovery = null
@@ -388,12 +390,6 @@ export class Ragdoll {
     this.sitBlend = 0
     this.seatVisible = this.seat.visible = false
     this.setSeatCollision(false)
-    if (preserveHeight && height - support < 1.6) {
-      this.heldSupportHeight = support
-      pelvis.setEnabledTranslations(true, false, true, true)
-      const velocity = pelvis.linvel()
-      pelvis.setLinvel(v(velocity.x, 0, velocity.z), true)
-    }
     // Keep the current momentum, but remove any remaining balance torque immediately.
     this.parts.forEach(({ body }) => body.resetTorques(true))
   }
@@ -477,7 +473,7 @@ export class Ragdoll {
       this.heading += rotation
       this.turnRate = THREE.MathUtils.damp(this.turnRate, rotation / dt, 6, dt)
     } else this.turnRate = THREE.MathUtils.damp(this.turnRate, 0, 6, dt)
-    const boosting = this.running && this.flightThrottle > 0
+    const boosting = this.running && this.direction.lengthSq() > .001 && !this.falling
     this.flightBoost = THREE.MathUtils.clamp(this.flightBoost
       + dt * (boosting ? 1 / FLIGHT_BOOST_DURATION : -1 / FLIGHT_BOOST_RELEASE_DURATION), 0, 1)
     // Ease in and out of acceleration instead of jumping straight to the 10x target.
@@ -506,14 +502,22 @@ export class Ragdoll {
     // Bank follows the actual turn, with a smaller input-driven trim.
     const bank = THREE.MathUtils.clamp(-this.turnRate * .16 - this.flightBank * .08, -.5, .5) * this.flightBlend
     this.flightPitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1))
+    // Measure travel in the view-facing frame, so diagonal and reverse inputs
+    // blend their own poses instead of reusing the forward-flight silhouette.
+    this.flightTravel.copy(this.moveVelocity).setY(0)
+    if (this.flightTravel.lengthSq() > .001) this.flightTravel.normalize()
+    else this.flightTravel.set(0, 0, 0)
+    this.q1.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, -this.heading)
+    this.flightTravel.applyQuaternion(this.q1)
     this.animation.fly(dt, this.falling ? 0 : this.flightBlend, this.flightPitch, bank, this.verticalVelocity,
-      launch, this.falling ? 1 : approach, this.moveVelocity.length())
+      launch, this.falling ? 1 : approach, this.moveVelocity.length(), this.flightTravel.z, this.flightTravel.x,
+      THREE.MathUtils.smootherstep(this.flightBoost, 0, 1))
     this.flightEuler.set(this.animation.pitch, this.heading, this.animation.roll, 'YXZ')
     this.flightRotation.setFromEuler(this.flightEuler)
     this.torsoTarget.copy(this.flightRotation)
     this.applyLimbPose('left', this.animation.left)
     this.applyLimbPose('right', this.animation.right)
-    this.applyHeadPose()
+    // Airborne head targets are calculated after the chest transform is known.
     if (!this.ascentHeld && this.verticalVelocity <= 0 && this.supportTarget.y <= landing + .01
       && this.parts.get('pelvis')!.body.translation().y < landing + .22) {
       this.airborne = false
@@ -573,7 +577,7 @@ export class Ragdoll {
     }
   }
 
-  private ballPose(id: string, angle: number, stiffness: number, yaw = 0, roll = 0) {
+  private ballPose(id: string, angle: number, stiffness: number, yaw = 0, roll = 0, response = this.poseResponse) {
     const joint = this.ballMotors.get(id)!
     let previous = this.ballTargets.get(id)
     if (!previous) {
@@ -585,7 +589,7 @@ export class Ragdoll {
       const angleTarget = i === 0 ? angle : i === 1 ? yaw : roll
       const target = THREE.MathUtils.clamp(angleTarget, -joint.limits[i] * .95, joint.limits[i] * .95)
       const current = previous.getComponent(i)
-      const next = THREE.MathUtils.damp(current, target, this.poseResponse, this.poseDt)
+      const next = THREE.MathUtils.damp(current, target, response, this.poseDt)
       joint.motor.configureMotor(axis, next, THREE.MathUtils.clamp((next - current) / this.poseDt, -8, 8),
         stiffness, 2 * Math.sqrt(stiffness * joint.inertia))
       previous.setComponent(i, next)
@@ -612,7 +616,24 @@ export class Ragdoll {
     this.hingePose(`${side}Forearm`, THREE.MathUtils.lerp(pose.elbow, -.85, sitting), 24, 3)
   }
 
-  private applyHeadPose() {
+  private applyHeadPose(chestRotation?: THREE.Quaternion) {
+    if (this.airborne && chestRotation) {
+      const yaw = Math.hypot(this.viewDirection.x, this.viewDirection.z) > .001
+        ? Math.atan2(this.viewDirection.x, this.viewDirection.z) : this.heading
+      const pitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1))
+      this.headEuler.set(pitch, yaw, 0, 'YXZ')
+      this.headAim.setFromEuler(this.headEuler).premultiply(this.q2.copy(chestRotation).invert())
+      // Split the complete relative rotation across neck and head. This also
+      // cancels body bank and twist, keeping the eyes level with camera aim.
+      for (const [id, share, stiffness] of [['neck', .32, 70], ['head', .68, 50]] as const) {
+        this.headShare.identity().slerp(this.headAim, share)
+        this.headEuler.setFromQuaternion(this.headShare, 'XYZ')
+        // The body is already smoothed. Counter-rotation must follow it in the
+        // same frame, otherwise the eyes drift off target during direction changes.
+        this.ballPose(id, this.headEuler.x, stiffness, this.headEuler.y, this.headEuler.z, Infinity)
+      }
+      return
+    }
     if (this.airborne || this.aiming) {
       const pitch = -Math.asin(THREE.MathUtils.clamp(this.viewDirection.y, -1, 1)) - this.animation.pitch
       const yaw = Math.atan2(this.viewDirection.x, this.viewDirection.z) - this.heading
@@ -697,19 +718,19 @@ export class Ragdoll {
       this.setSeatCollision(false)
     }
     const hasDirection = this.direction.lengthSq() > 0.001 && !this.sitting && this.sitBlend < 0.12
-    let alignment = 1
     if (hasDirection || this.aiming) {
       this.standHeight = this.groundHeight + STAND_HEIGHT - .04
-      const targetHeading = this.aiming ? Math.atan2(this.viewDirection.x, this.viewDirection.z)
-        : Math.atan2(this.direction.x, this.direction.z)
+      // Keep facing the view so backward and lateral inputs produce actual
+      // backsteps and strafing instead of turning every input into a run.
+      const targetHeading = Math.hypot(this.viewDirection.x, this.viewDirection.z) > .001
+        ? Math.atan2(this.viewDirection.x, this.viewDirection.z) : this.heading
       const difference = Math.atan2(Math.sin(targetHeading - this.heading), Math.cos(targetHeading - this.heading))
       const rotation = THREE.MathUtils.clamp(difference, -3.8 * dt, 3.8 * dt)
       this.heading += rotation
       this.turnRate = THREE.MathUtils.damp(this.turnRate, rotation / dt, 8, dt)
-      alignment = Math.max(0.15, Math.cos(difference))
     } else this.turnRate = THREE.MathUtils.damp(this.turnRate, 0, 8, dt)
     const speed = this.running ? RUN_SPEED : 2.4
-    this.position.copy(this.direction).multiplyScalar(hasDirection ? speed * alignment : 0)
+    this.position.copy(this.direction).multiplyScalar(hasDirection ? speed : 0)
     this.moveVelocity.lerp(this.position, 1 - Math.exp(-8 * dt))
     this.supportTarget.addScaledVector(this.moveVelocity, dt)
     // Sample at the new position every physics step, including while idle.
@@ -822,7 +843,10 @@ export class Ragdoll {
     this.q1.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, -this.animation.twist)
     pelvis.targetRotation.copy(this.torsoTarget).multiply(this.q1)
     // Links are constructed from torso to fingertips/toes, in parent-first order.
-    for (const link of this.poseLinks) this.animateLink(link)
+    for (const link of this.poseLinks) {
+      if (this.airborne && link.child.mesh.userData.partId === 'neck') this.applyHeadPose(link.parent.targetRotation)
+      this.animateLink(link)
+    }
     if (!this.airborne && !this.recovery && this.sitBlend < .12) this.plantFeet()
   }
 
@@ -941,6 +965,11 @@ export class Ragdoll {
           undefined, undefined, undefined, other => {
             if (!this.isGroundCollider(other)) return false
             if (this.breakingFlight && this.buildingCollider?.(other)) return false
+            this.impactVelocity.copy(this.velocity)
+            const obstacle = other.parent()
+            if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(collider.translation()))
+            if (this.impactPassThrough?.(other, Math.max(this.impactVelocity.length(),
+              Math.hypot(this.moveVelocity.length(), this.verticalVelocity)))) return false
             if (id.endsWith('Foot') && this.isFootSupport(other, collider)) return false
             // An initially penetrating sole can give a degenerate sweep normal.
             // Use its existing contact normal to exclude ordinary support first.
@@ -973,7 +1002,10 @@ export class Ragdoll {
         if (hit && !this.isSupportContact(hit.normal1)
           && !(id.endsWith('Foot') && this.isFootSupport(hit.collider, collider))
           && !(this.isLowerLeg(id) && this.isWalkableStep(hit.collider, hit.witness1, hit.normal1))) {
-          onContact(hit.collider, hit.witness1, hit.normal1)
+          this.impactVelocity.copy(this.velocity)
+          const obstacle = hit.collider.parent()
+          if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(hit.witness1))
+          onContact(hit.collider, hit.witness1, hit.normal1, this.impactVelocity.length())
         }
       }
     }
@@ -1023,17 +1055,24 @@ export class Ragdoll {
               const walkable = footSupport || this.isSupportContact(this.contactNormal)
                 || (this.isLowerLeg(id) && this.isWalkableStep(other, this.contactPoint, this.contactNormal))
               if (walkable) continue
-              if (canRelease && manifold.contactDist(j) <= .001) impact = true
               if (onContact && manifold.contactDist(j) <= .001) {
                 const surface = flipped ? manifold.localContactPoint1(j) : manifold.localContactPoint2(j)
                 if (surface) {
                   const point = new THREE.Vector3().copy(surface).applyQuaternion(new THREE.Quaternion().copy(other.rotation())).add(other.translation())
-                  onContact(other, point, this.contactNormal)
+                  this.impactVelocity.copy(previousVelocity)
+                  const obstacle = other.parent()
+                  if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(point))
+                  onContact(other, point, this.contactNormal, this.impactVelocity.length())
                 }
               }
               this.impactVelocity.copy(previousVelocity)
               const obstacle = other.parent()
               if (obstacle) this.impactVelocity.sub(obstacle.velocityAtPoint(this.contactPoint))
+              // Destruction still receives the contact, but a breakable prop cannot knock
+              // the controlled hero down above its destruction threshold (including rubble).
+              if (this.impactPassThrough?.(other, Math.max(this.impactVelocity.length(),
+                Math.hypot(this.moveVelocity.length(), this.verticalVelocity)))) continue
+              if (canRelease && manifold.contactDist(j) <= .001) impact = true
               const speed = Math.max(0, -this.impactVelocity.dot(this.contactNormal))
               if (speed > strongest) {
                 strongest = speed

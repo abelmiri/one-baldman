@@ -23,6 +23,7 @@ const C = {
 export class City {
   readonly root = new THREE.Group()
   readonly destruction: LaserDestruction
+  private vegetationSurfaces: THREE.Mesh[] = []
   private structureOwner?: Destructible
   private batches = new Map<Shape, Instance[]>()
   private occlusion = new CameraOcclusion()
@@ -94,10 +95,13 @@ export class City {
     this.bridge()
     // These standalone meshes and lights are built outside the instanced transform.
     for (const object of this.root.children) {
+      if (object.userData.worldSpaceEffect) continue
       object.position.multiplyScalar(CITY_SCALE)
       object.scale.multiplyScalar(CITY_SCALE)
       if (object instanceof THREE.PointLight) object.distance *= CITY_SCALE
     }
+    this.root.updateMatrixWorld(true)
+    for (const mesh of this.vegetationSurfaces) this.destruction.registerVegetation(new THREE.Box3().setFromObject(mesh))
     this.flush()
     this.createTraffic()
     const drops = new Float32Array(120 * 3)
@@ -134,6 +138,10 @@ export class City {
     const instance = { matrix, color: new THREE.Color(color), surface, geometry: this.geometries[shape],
       buildingOwner }
     this.batches.get(shape)!.push(instance)
+    if (this.structureOwner?.kind !== 'tree' && [C.grass, C.lawn, C.hedge, C.leaf, C.lime, '#6d7b3b'].includes(color)) {
+      instance.geometry.computeBoundingBox()
+      this.destruction.registerVegetation(instance.geometry.boundingBox!.clone().applyMatrix4(matrix))
+    }
     // Ground paths stay in the static city even when the structure above is cut.
     if (this.structureOwner && y + sy / 2 > .3) this.structureOwner.parts.push(instance)
   }
@@ -253,6 +261,7 @@ export class City {
     const surface = this.surfaceForColor(color)
     const mesh = new THREE.Mesh(surface ? this.textures.apply(geometry, surface) : geometry,
       surface ? this.textures.surfaceMaterial(color) : new THREE.MeshStandardMaterial({ color, roughness: .95 }))
+    if (surface === 'grass') this.vegetationSurfaces.push(mesh)
     mesh.rotation.x = -Math.PI / 2
     mesh.position.set(x, y, z)
     mesh.receiveShadow = true

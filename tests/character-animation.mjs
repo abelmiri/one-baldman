@@ -105,6 +105,92 @@ for (const fps of [30, 60, 120]) {
   runningResults.push({ fps, steps: runSteps, clearance, knee, airborne })
 }
 
+// Direction is relative to the facing, including when the camera turns.
+const directionalResults = []
+for (const fps of [30, 60, 120]) {
+  for (const heading of [0, 1.2]) {
+    for (const [name, x, z] of [['back', 0, -1], ['left', 1, 0], ['right', -1, 0],
+      ['forward diagonal', .707, .707], ['back diagonal', -.707, -.707]]) {
+      for (const boosted of [false, true]) {
+        const animation = new CharacterAnimation()
+        const facing = new THREE.Quaternion().setFromAxisAngle(THREE.Object3D.DEFAULT_UP, heading)
+        const pelvis = new THREE.Vector3(0, 1.23, 0)
+        const velocity = new THREE.Vector3(x, 0, z).normalize().multiplyScalar(boosted ? 6.40332 : 2.4).applyQuaternion(facing)
+        const starts = []
+        let clearance = 0
+        const step = () => {
+          const previous = animation.feet.map(f => ({ swinging: f.swinging, position: f.position.clone(), initialized: f.initialized }))
+          pelvis.addScaledVector(velocity, 1 / fps)
+          animation.walk(1 / fps, pelvis, facing, heading, velocity, boosted, 0, 0, ground)
+          for (const pose of [animation.left, animation.right]) {
+            assert(Object.values(pose).every(Number.isFinite), `${name}: non-finite pose`)
+            assert(pose.knee >= 0 && pose.knee <= 2.45, `${name}: knee outside limits`)
+            assert(Math.abs(pose.ankleRoll) <= .28, `${name}: ankle outside roll limits`)
+          }
+          animation.feet.forEach((foot, side) => {
+            if (foot.swinging && !previous[side].swinging) starts.push(side)
+            if (previous[side].initialized && !foot.swinging && !previous[side].swinging) {
+              assert(foot.position.distanceTo(previous[side].position) < 1e-8, `${name}: support foot slid`)
+            }
+            clearance = Math.max(clearance, foot.position.y - .265)
+          })
+        }
+        for (let i = 0; i < fps * 5; i++) step()
+        assert(starts.length >= 8, `${name}: feet did not keep stepping`)
+        assert(starts.every((side, i) => !i || side !== starts[i - 1]), `${name}: steps did not alternate`)
+        assert(clearance > .07, `${name}: foot did not clear ground`)
+        if (z <= 0) {
+          assert(animation.feet.filter(f => f.swinging).length <= 1, `${name}: shuffle used airborne sprint`)
+          assert(Math.abs(animation.pitch) < .1, `${name}: used forward sprint lean`)
+          assert(animation.left.elbow > -.8, `${name}: used sprint arms`)
+        }
+        if (z === 0) assert(Math.sign(animation.roll) === -Math.sign(x), `${name}: body did not lean into side step`)
+        // Reverse direction while moving, then settle back to a planted idle.
+        velocity.negate()
+        for (let i = 0; i < fps; i++) step()
+        velocity.set(0, 0, 0)
+        for (let i = 0; i < fps * 3; i++) step()
+        assert(animation.feet.every(f => !f.swinging), `${name}: transition left foot suspended`)
+        directionalResults.push({ fps, heading, name, boosted, steps: starts.length })
+      }
+    }
+  }
+}
+
+const flightDirections = []
+for (const fps of [30, 60, 120]) for (const boosted of [false, true]) {
+  const signatures = []
+  for (let octant = 0; octant < 8; octant++) {
+    const animation = new CharacterAnimation()
+    const angle = octant * Math.PI / 4
+    for (let i = 0; i < fps * 4; i++) {
+      animation.fly(1 / fps, 1, 0, 0, 0, 0, 0, boosted ? 110 : 11,
+        Math.cos(angle), Math.sin(angle), Number(boosted))
+      for (const pose of [animation.left, animation.right]) {
+        assert(Object.values(pose).every(Number.isFinite), 'non-finite directional flight pose')
+        assert(pose.knee >= 0 && pose.knee <= 2.45, 'directional flight knee outside limits')
+      }
+    }
+    if (!boosted) assert(Math.abs(animation.pitch) < .3, 'slow flight used the fast-flight pose')
+    if (Math.abs(Math.sin(angle)) > .1) assert(Math.sign(animation.roll) === -Math.sign(Math.sin(angle)), 'flight bank opposes lateral travel')
+    if (octant === 0 && boosted) assert(animation.pitch > 1.1 && animation.left.shoulder < -2.4, 'forward sprint lost its Superman pose')
+    if (octant === 4) assert(animation.pitch < -.15 && animation.left.knee > .5, 'reverse flight lost its braced pose')
+    signatures.push([animation.pitch, animation.roll, animation.left.hip, animation.right.hip,
+      animation.left.shoulder, animation.right.shoulder].map(v => v.toFixed(2)).join(','))
+    // Reverse while boosting, then return to hover without a pose snap.
+    let previousPitch = animation.pitch, previousRoll = animation.roll
+    for (let i = 0; i < fps * 2; i++) {
+      animation.fly(1 / fps, 1, 0, 0, 0, 0, 0, 11, -Math.cos(angle), -Math.sin(angle), 0)
+      assert(Math.abs(animation.pitch - previousPitch) < .15 && Math.abs(animation.roll - previousRoll) < .15, 'flight direction change snapped the body')
+      previousPitch = animation.pitch; previousRoll = animation.roll
+    }
+    for (let i = 0; i < fps * 3; i++) animation.fly(1 / fps, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    assert(Math.abs(animation.roll) < .01 && Math.abs(animation.pitch) < .1, 'directional flight did not return to hover')
+    flightDirections.push({ fps, boosted, octant })
+  }
+  assert(new Set(signatures).size === 8, 'flight directions did not have eight distinct poses')
+}
+
 const flight = new CharacterAnimation()
 for (const glide of [0, .5, 1]) {
   for (const bank of [-.5, 0, .5]) {
@@ -134,4 +220,4 @@ for (const style of ['back', 'front', 'left', 'right']) {
     assert(Object.values(flight.right).every(Number.isFinite))
   }
 }
-console.log(JSON.stringify({passed: true, walking: results, running: runningResults, flight: 'hover, cruise, banks, landing and recovery passed'}, null, 2))
+console.log(JSON.stringify({passed: true, walking: results, running: runningResults, directionalCases: directionalResults.length, flightDirectionCases: flightDirections.length, flight: 'hover, cruise, banks, landing and recovery passed'}, null, 2))

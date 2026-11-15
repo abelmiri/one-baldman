@@ -9,6 +9,7 @@ export class CapeSurface {
   private weave: THREE.DataTexture
   private samples: { indices: number[]; weights: number[] }[] = []
   private count: number
+  private columnCount: number
   private particles: Float32Array
   private columns: Float32Array
   private folds: Float32Array
@@ -17,18 +18,20 @@ export class CapeSurface {
 
   constructor(particleCount: number, subdivisions = SUBDIVISIONS) {
     this.count = (particleCount - 1) * subdivisions + 1
+    // Twice as many panels across the cape resolve its narrow vertical folds.
+    this.columnCount = (this.count - 1) * 2 + 1
     this.particles = new Float32Array(particleCount * particleCount * 3)
-    this.columns = new Float32Array(this.count * particleCount * 3)
-    this.folds = new Float32Array(this.count * this.count)
+    this.columns = new Float32Array(this.columnCount * particleCount * 3)
+    this.folds = new Float32Array(this.columnCount * this.count)
     this.rippleSines = new Float32Array(this.folds.length)
     this.rippleCosines = new Float32Array(this.folds.length)
-    const positions = new Float32Array(this.count * this.count * 3)
-    const uv = new Float32Array(this.count * this.count * 2)
+    const positions = new Float32Array(this.columnCount * this.count * 3)
+    const uv = new Float32Array(this.columnCount * this.count * 2)
     const colors = new Float32Array(positions.length)
     const indices: number[] = []
     const color = new THREE.Color()
-    for (let column = 0; column < this.count; column++) {
-      const u = column / (this.count - 1)
+    for (let column = 0; column < this.columnCount; column++) {
+      const u = column / (this.columnCount - 1)
       const coordinate = u * (particleCount - 1)
       const cell = Math.min(Math.floor(coordinate), particleCount - 2)
       const t = coordinate - cell
@@ -52,7 +55,7 @@ export class CapeSurface {
         const edge = Math.min(u, 1 - u, 1 - v)
         color.set(edge < .009 ? '#9a1923' : edge < .025 ? '#d74a45' : '#ffffff')
         colors.set([color.r, color.g, color.b], index * 3)
-        if (column < this.count - 1 && row < this.count - 1) {
+        if (column < this.columnCount - 1 && row < this.count - 1) {
           indices.push(index, index + 1, index + this.count, index + 1, index + this.count + 1, index + this.count)
         }
       }
@@ -69,7 +72,7 @@ export class CapeSurface {
     for (let y = 0; y < size; y++) {
       for (let x = 0; x < size; x++) {
         const grain = ((x * 73 + y * 151 + x * y * 13) % 31) / 31
-        const height = 110 + 24 * Math.sin(x * Math.PI / 2) * Math.cos(y * Math.PI / 2) + grain * 18
+        const height = 110 + 14 * Math.sin(x * Math.PI / 2) * Math.cos(y * Math.PI / 2) + grain * 8
         const index = (y * size + x) * 4
         threads.set([height, height, height, 255], index)
       }
@@ -83,8 +86,8 @@ export class CapeSurface {
     this.weave.needsUpdate = true
     this.material = new THREE.MeshPhysicalMaterial({
       color: '#b51e2b', side: THREE.DoubleSide, vertexColors: true,
-      roughness: .88, metalness: 0, sheen: 1, sheenColor: '#df5550', sheenRoughness: .78,
-      bumpMap: this.weave, bumpScale: .008,
+      roughness: .94, metalness: 0, sheen: 1, sheenColor: '#df5550', sheenRoughness: .9,
+      bumpMap: this.weave, bumpScale: .003,
     })
   }
 
@@ -97,7 +100,7 @@ export class CapeSurface {
     for (let i = 0; i < current.length; i++) {
       this.particles[i] = previous[i] + (current[i] - previous[i]) * alpha
     }
-    for (let column = 0; column < this.count; column++) {
+    for (let column = 0; column < this.columnCount; column++) {
       const across = this.samples[column]
       for (let row = 0; row < particleCount; row++) {
         const output = (column * particleCount + row) * 3
@@ -110,9 +113,9 @@ export class CapeSurface {
         }
       }
     }
-    for (let column = 0; column < this.count; column++) {
+    for (let column = 0; column < this.columnCount; column++) {
       for (let row = 0; row < this.count; row++) {
-        const down = this.samples[row]
+        const down = this.samples[row * 2]
         const output = (column * this.count + row) * 3
         for (let axis = 0; axis < 3; axis++) {
           let value = 0
@@ -126,7 +129,7 @@ export class CapeSurface {
     this.updateNormals(positions)
     const normals = this.geometry.getAttribute('normal')
     const rippleSin = Math.sin(time * 1.65), rippleCos = Math.cos(time * 1.65)
-    for (let column = 0; column < this.count; column++) {
+    for (let column = 0; column < this.columnCount; column++) {
       for (let row = 1; row < this.count; row++) {
         const index = column * this.count + row
         // Residual pleats survive still air. Small travelling ripples give the

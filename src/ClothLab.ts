@@ -34,8 +34,9 @@ const CAPE_MASS = 1.2
 // Cape collides with the environment (1), itself (2) and body copies (8).
 // The real ragdoll (4) and sewn shoulder copies (16) never receive cape forces.
 const CAPE_COLLISION_GROUPS = 0x0002000b
-const STEP = 1 / 60
-const MAX_STEPS_PER_FRAME = 2
+// Fixed 120 Hz physics; rendering interpolates on every display refresh.
+const STEP = 1 / 120
+const MAX_STEPS_PER_FRAME = 4
 const MAX_RENDER_PIXELS = 3_000_000
 const CAMERA_ROTATE_SPEED = 1.35
 const CAMERA_SHOULDER_OFFSET = 1.4
@@ -108,7 +109,7 @@ export class ClothLab {
   private impactDestruction = false
   private impactDestructionUntil: number | null = null
   private impactDestructionRecovery = false
-  private destructionContacts: { collider: RAPIER.Collider; point: THREE.Vector3; normal: THREE.Vector3 }[] = []
+  private destructionContacts: { collider: RAPIER.Collider; point: THREE.Vector3; normal: THREE.Vector3; speed: number }[] = []
   private flightContacts: { collider: RAPIER.Collider; from: THREE.Vector3; to: THREE.Vector3; normal: THREE.Vector3 }[] = []
   private impactShake = new ImpactShake()
   private flightFrom = new THREE.Vector3()
@@ -254,6 +255,7 @@ export class ClothLab {
     const cape = this.settings.mode === 'cape'
     this.ragdoll = new Ragdoll(this.world, this.scene, 0, this.settings.standing, this.onImpact, this.invalidate)
     this.ragdoll.configureFlightDestruction(this.recordFlightContact, this.isBuildingCollider)
+    this.ragdoll.configureImpactPassThrough(this.canBreakPropWithoutFalling)
     this.ragdoll.controlFocus(this.focus)
     if (this.cameraView === 'player') this.setCameraView('player')
 
@@ -323,30 +325,25 @@ export class ClothLab {
     this.flightContacts.length = 0
     this.ragdoll.setCollisionProtection(this.impactDestruction && this.settings.standing
       && (this.impactDestructionRecovery || this.impactDestructionUntil !== null))
-    const destructiveContacts = this.impactDestruction && this.settings.standing && !this.ragdoll.isReleased
-      ? this.recordDestructiveContact : undefined
+    const destructiveContacts = this.recordDestructiveContact
     const wasRecovering = this.ragdoll.isRecovering
     this.ragdoll.step(STEP, destructiveContacts, this.isDestructibleCollider)
     if (this.impactDestructionRecovery && !this.ragdoll.isRecovering && (wasRecovering || !this.ragdoll.isReleased)) {
       this.impactDestructionRecovery = false
       this.impactDestructionUntil = this.elapsed + 3
     }
-    this.capeMotion?.beforeStep(STEP)
+    this.capeMotion?.beforeStep(STEP, this.settings.wind, this.settings.windDirection, this.elapsed)
     this.cloth.resetForces(true)
-    if (this.settings.wind > 0) {
+    if (this.settings.wind > 0 && !this.capeMotion) {
       const wind = this.settings.wind / 3
       const angle = this.settings.windDirection * Math.PI / 180
-      const gust = 0.8 + 0.2 * Math.sin(this.elapsed * 2.4)
-      // A worn cape can take continuous wind; alternate gusts on the free sheet.
-      const force = this.settings.mode === 'cape'
-        ? wind * CAPE_MASS * 0.052 * gust
-        : wind * 0.08 * Math.sin(this.elapsed * 2.8)
+      const force = wind * 0.08 * Math.sin(this.elapsed * 2.8)
       this.cloth.addForce(vector(Math.cos(angle) * force, 0, Math.sin(angle) * force), true)
     }
     this.previousClothPositions.set(this.clothPositions)
     this.world.step()
-    this.ragdoll.checkForImpact(this.ragdoll.isReleased ? undefined : destructiveContacts)
-    for (const contact of this.destructionContacts) this.city.destruction.queueContact(contact.collider, contact.point, contact.normal)
+    this.ragdoll.checkForImpact(destructiveContacts)
+    for (const contact of this.destructionContacts) this.city.destruction.queueContact(contact.collider, contact.point, contact.normal, contact.speed)
     for (const contact of this.flightContacts) this.city.destruction.queueFlightPath(contact.collider, contact.from, contact.to, contact.normal)
     if (this.ragdoll.copyFlightSegment(this.flightFrom, this.flightTo)) this.city.destruction.continueFlightPath(this.flightFrom, this.flightTo)
     else this.city.destruction.endFlightPath()
@@ -382,14 +379,18 @@ export class ClothLab {
       // Bound catch-up work so a slow frame cannot start a growing physics backlog.
       this.accumulator = Math.min(this.accumulator + delta, STEP * MAX_STEPS_PER_FRAME)
       let steps = 0
-      while (this.accumulator >= STEP && steps < MAX_STEPS_PER_FRAME) {
+      // Timestamp rounding must not drop a whole tick at 30/60/120 Hz,
+      // especially when the accumulator reaches the catch-up ceiling.
+      while (this.accumulator >= STEP - 1e-9 && steps < MAX_STEPS_PER_FRAME) {
         this.step()
-        this.accumulator -= STEP
+        this.accumulator = Math.max(0, this.accumulator - STEP)
         steps++
       }
       this.updateMesh(this.accumulator / STEP)
       this.ragdoll?.sync(this.accumulator / STEP)
       this.city.update(Math.max(0, this.elapsed - STEP + this.accumulator))
+      this.ragdoll?.renderFocus(this.focus)
+      this.city.destruction.updateDebris(delta, this.ragdoll ? this.focus : undefined)
       this.adaptResolution(frameDelta, delta)
     }
     if (this.settings.playing && this.ragdoll && time - this.telemetryTime > 100) {
@@ -598,19 +599,28 @@ export class ClothLab {
       this.impactDestruction = false
       this.impactDestructionUntil = null
       this.impactDestructionRecovery = false
-      this.ragdoll.release(true)
+      this.ragdoll.release()
     }
   }
 
-  private recordDestructiveContact = (collider: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like) => {
+  private recordDestructiveContact = (collider: RAPIER.Collider, point: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => {
     const owner = this.city.destruction.ownerOf(collider)
-    if (this.ragdoll?.isBreakingFlight && owner?.kind === 'building') return
+    if (owner?.kind === 'building' && (!this.impactDestruction || !this.settings.standing || this.ragdoll?.isReleased || this.ragdoll?.isBreakingFlight)) return
+    if (owner?.kind !== 'building' && speed * 3.6 <= 50) return
     if (!owner || this.destructionContacts.some(contact => this.city.destruction.ownerOf(contact.collider) === owner
       && contact.point.distanceToSquared(point) < .25)) return
-    this.destructionContacts.push({ collider, point: new THREE.Vector3().copy(point), normal: new THREE.Vector3().copy(normal) })
+    this.destructionContacts.push({ collider, point: new THREE.Vector3().copy(point), normal: new THREE.Vector3().copy(normal), speed })
   }
 
-  private isDestructibleCollider = (collider: RAPIER.Collider) => !!this.city.destruction.ownerOf(collider)
+  private canBreakPropWithoutFalling = (collider: RAPIER.Collider, speed: number) => {
+    const owner = this.city.destruction.ownerOf(collider)
+    return (owner?.kind === 'tree' || owner?.kind === 'car') && speed * 3.6 > 50
+  }
+
+  private isDestructibleCollider = (collider: RAPIER.Collider) => {
+    const owner = this.city.destruction.ownerOf(collider)
+    return !!owner && (owner.kind === 'building' ? this.impactDestruction : !owner.damaged)
+  }
   private isBuildingCollider = (collider: RAPIER.Collider) => this.city.destruction.ownerOf(collider)?.kind === 'building'
 
   private recordFlightContact = (collider: RAPIER.Collider, from: THREE.Vector3Like, to: THREE.Vector3Like, normal: THREE.Vector3Like, speed: number) => {

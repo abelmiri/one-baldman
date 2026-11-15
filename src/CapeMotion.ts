@@ -2,7 +2,6 @@ import * as THREE from 'three'
 import RAPIER from '@dimforge/rapier3d'
 
 const MAX_STRETCH = 1.035
-const VERTICAL_AIR_DRAG = .8
 // Let the cloth approach the frontmost collar point, but never flip over the wearer.
 const FORWARD_ALLOWANCE = .025
 
@@ -18,12 +17,19 @@ export class CapeMotion {
   private carrierAngularVelocity = new THREE.Vector3()
   private boundaryVelocity = new THREE.Vector3()
   private particleVelocity = new THREE.Vector3()
+  private normal = new THREE.Vector3()
+  private across = new THREE.Vector3()
+  private down = new THREE.Vector3()
+  private airVelocity = new THREE.Vector3()
+  private relativeAir = new THREE.Vector3()
   private edges: { a: number; b: number; length: number }[] = []
   private columnLengths: Float32Array
   private original: Float32Array
+  private dampedVelocities: Float32Array
 
   constructor(private cloth: RAPIER.SoftBody, private carrier: RAPIER.RigidBody, private count: number) {
     this.original = new Float32Array(cloth.particlePositions())
+    this.dampedVelocities = new Float32Array(count * count * 3)
     this.columnLengths = new Float32Array(count * count)
     const edges = cloth.edges()
     for (let i = 0; i < edges.length / 2; i++) {
@@ -39,20 +45,67 @@ export class CapeMotion {
     }
   }
 
-  beforeStep(dt: number) {
+  beforeStep(dt: number, wind = 0, windDirection = 0, time = 0) {
     this.carrierVelocity.copy(this.carrier.nextTranslation()).sub(this.carrier.translation()).divideScalar(dt)
-    const drag = Math.exp(-dt)
+    const drag = Math.exp(-.3 * dt)
     const velocities = this.cloth.particleVelocities()
+    const positions = this.cloth.particlePositions()
+    this.dampedVelocities.set(velocities)
+    // Internal fabric friction removes short-wavelength chatter without
+    // resisting the cape's shared motion or pulling its folds flat.
+    // Read a snapshot so damping is independent of edge traversal order.
+    const smoothing = .5 * (1 - Math.exp(-12 * dt))
+    for (const { a, b } of this.edges) {
+      if (a % this.count === 0 || b % this.count === 0) continue
+      for (let axis = 0; axis < 3; axis++) {
+        const ai = a * 3 + axis, bi = b * 3 + axis
+        const exchange = (velocities[bi] - velocities[ai]) * smoothing
+        this.dampedVelocities[ai] += exchange
+        this.dampedVelocities[bi] -= exchange
+      }
+    }
+    const angle = windDirection * Math.PI / 180
+    const windSpeed = Math.max(0, wind) * .18
     for (let i = 0; i < this.count * this.count; i++) {
       if (i % this.count === 0) continue // Sewn particles are owned by their rigid anchors.
-      this.velocity.fromArray(velocities, i * 3)
-      this.velocity.sub(this.previousCarrierVelocity).multiplyScalar(drag)
-        .addScaledVector(this.carrierVelocity, -.35 * dt).add(this.carrierVelocity)
-      // Resist vertical motion through still air in world space. Carrier-frame
-      // damping alone carries the cape down with the body instead of letting
-      // the hem trail upward in freefall. This quadratic drag update stays
-      // stable at high descent speeds and also lets the cape settle on landing.
-      this.velocity.y /= 1 + VERTICAL_AIR_DRAG * Math.abs(this.velocity.y) * dt
+      const column = Math.floor(i / this.count), row = i % this.count
+      const exposure = row / (this.count - 1)
+      this.velocity.fromArray(this.dampedVelocities, i * 3)
+      // Carry most of a fast translation with the wearer to keep the coarse
+      // solver stable, retaining inertia instead of instantly matching a stop.
+      // The shoulders follow the wearer closely while the hem lags behind,
+      // letting starts, braking and turns send a broad wave down the fabric.
+      const carry = THREE.MathUtils.lerp(.88, .62, THREE.MathUtils.smoothstep(exposure, 0, 1))
+      this.velocity.addScaledVector(this.carrierVelocity, carry)
+        .addScaledVector(this.previousCarrierVelocity, -carry)
+        .sub(this.carrierVelocity).multiplyScalar(drag).add(this.carrierVelocity)
+
+      // Local surface orientation determines how much air the fabric catches.
+      // Centred differences use the physical folds, including during ragdolls.
+      this.across.fromArray(positions, (Math.min(column + 1, this.count - 1) * this.count + row) * 3)
+        .sub(this.position.fromArray(positions, (Math.max(column - 1, 0) * this.count + row) * 3))
+      this.down.fromArray(positions, (column * this.count + Math.min(row + 1, this.count - 1)) * 3)
+        .sub(this.position.fromArray(positions, (i - 1) * 3))
+      this.normal.crossVectors(this.across, this.down).normalize()
+      this.position.fromArray(positions, i * 3)
+      // Continuous world-space gusts travel across the cloth; the hem receives
+      // more turbulence than the sheltered collar, without random frame noise.
+      const phase = time * 2.1 - this.position.x * .65 - this.position.z * .43
+      const gust = 1 + .18 * Math.sin(phase) + .08 * Math.sin(phase * 2.37 + this.position.y)
+      this.airVelocity.set(Math.cos(angle), 0, Math.sin(angle)).multiplyScalar(windSpeed * gust)
+      const flutter = windSpeed * .09 * exposure * Math.sin(phase * 1.73 + column * .41)
+      this.airVelocity.x -= Math.sin(angle) * flutter
+      this.airVelocity.z += Math.cos(angle) * flutter
+      this.airVelocity.y = flutter * .55
+      this.relativeAir.copy(this.velocity).sub(this.airVelocity)
+      const normalSpeed = this.relativeAir.dot(this.normal)
+      // Implicit quadratic drag cannot overshoot the air velocity at full boost.
+      // Normal pressure dominates; light tangential drag lets cloth stream out.
+      const normalDrag = .85 * Math.abs(normalSpeed) * dt
+      const skinDrag = .025 * this.relativeAir.length() * dt
+      this.relativeAir.addScaledVector(this.normal, -normalSpeed * normalDrag / (1 + normalDrag))
+        .multiplyScalar(1 / (1 + skinDrag))
+      this.velocity.copy(this.airVelocity).add(this.relativeAir)
       this.cloth.setParticleVelocity(i, this.velocity)
     }
     this.previousCarrierVelocity.copy(this.carrierVelocity)
@@ -71,7 +124,9 @@ export class CapeMotion {
       this.position.fromArray(positions, column * this.count * 3).sub(this.carrierPosition)
       forwardLimit = Math.max(forwardLimit, this.position.dot(this.forward))
     }
-    forwardLimit += FORWARD_ALLOWANCE
+    // Leave half a millimetre for Float32 rounding during the subsequent
+    // length projections, especially far from the city origin in flight.
+    forwardLimit += FORWARD_ALLOWANCE - .0005
     for (let i = 0; i < this.count * this.count; i++) {
       if (i % this.count === 0) continue
       const at = i * 3

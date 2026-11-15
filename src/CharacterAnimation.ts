@@ -102,6 +102,12 @@ export class CharacterAnimation {
   private lastStep = -1
   private previousSpeed = 0
   private acceleration = 0
+  private travelForward = 0
+  private travelSide = 0
+  private localVelocity = new THREE.Vector3()
+  private airForward = 0
+  private airSide = 0
+  private airBoost = 0
   private inverse = new THREE.Quaternion()
   private facing = new THREE.Quaternion()
   private forward = new THREE.Vector3()
@@ -121,6 +127,7 @@ export class CharacterAnimation {
     this.moving = false
     this.lastStep = -1
     this.weight = this.speed = this.previousSpeed = this.acceleration = this.run = 0
+    this.travelForward = this.travelSide = 0
   }
 
   getUp(style: GetUpStyle, progress: number) {
@@ -145,14 +152,28 @@ export class CharacterAnimation {
   walk(dt: number, pelvis: THREE.Vector3, rotation: THREE.Quaternion, heading: number,
     velocity: THREE.Vector3, running: boolean, turnRate: number, impact: number, sampleGround: GroundSampler, contacts: readonly boolean[] = [true, true]) {
     this.time += dt
-    this.speed = damp(this.speed, Math.min(velocity.length(), 13.2), 10, dt)
-    this.run = damp(this.run, running ? 1 : 0, 5, dt)
+    this.facing.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, heading)
+    this.inverse.copy(this.facing).invert()
+    this.localVelocity.copy(velocity).setY(0).applyQuaternion(this.inverse)
+    const groundSpeed = this.localVelocity.length()
+    const directionScale = 1 / Math.max(groundSpeed, .001)
+    this.travelForward = damp(this.travelForward, this.localVelocity.z * directionScale, 12, dt)
+    this.travelSide = damp(this.travelSide, this.localVelocity.x * directionScale, 12, dt)
+    const lateral = Math.abs(this.travelSide)
+    const backward = Math.max(0, -this.travelForward)
+    const forwardRun = smoothstep(this.travelForward, .55, .95)
+    this.speed = damp(this.speed, Math.min(groundSpeed, 13.2), 10, dt)
+    this.run = damp(this.run, running ? forwardRun : 0, 5, dt)
     this.weight = damp(this.weight, smoothstep(this.speed, .025, .3), 10, dt)
     this.acceleration = damp(this.acceleration, (this.speed - this.previousSpeed) / dt, 6, dt)
     this.previousSpeed = this.speed
     // Advance by travelled distance, so accelerating and blocked bodies don't walk in place.
     const run = this.run * smoothstep(this.speed, .6, 2.8)
-    const cycleDistance = lerp(2.56, 7.05, run)
+    // Backsteps are shorter; side steps use a low, wide shuffle. Faster
+    // lateral movement lengthens the step without using the sprint heel fold.
+    const walkDistance = lerp(lerp(2.3, 1.9, backward), 1.65, lateral)
+      * lerp(1, Math.max(1, this.speed / 3.2), Math.max(lateral, backward))
+    const cycleDistance = lerp(walkDistance, 7.05, run)
     const frequency = this.speed / cycleDistance
     // Begin with a step, instead of dragging both planted feet until the first
     // distance-driven cycle reaches its swing interval.
@@ -161,22 +182,22 @@ export class CharacterAnimation {
     const settling = this.speed < .1 && this.feet.some(foot => foot.swinging)
     this.phase = (this.phase + Math.max(frequency, settling ? .8 : 0) * dt) % 1
     const wave = Math.sin(this.phase * TAU)
-    this.pitch = this.weight * lerp(.055, .24, run) + clamp(this.acceleration * .018, -.07, .08)
+    this.pitch = this.weight * lerp(.055 * this.travelForward, .24, run)
+      + clamp(this.acceleration * .018, -.07, .08) * this.travelForward
       + Math.sin(this.time * 1.8) * .006 * (1 - this.weight)
-    this.roll = wave * .035 * this.weight - clamp(turnRate * this.speed * .016, -.08, .08)
-    this.twist = Math.cos(this.phase * TAU) * lerp(.075, .14, run) * this.weight
+    this.roll = (wave * .035 - this.travelSide * .075) * this.weight - clamp(turnRate * this.speed * .016, -.08, .08)
+    this.twist = Math.cos(this.phase * TAU) * lerp(.06 * (1 - lateral * .65), .14, run) * this.weight
     // Contact -> down -> passing -> up: absorb weight just after contact,
     // then rise over the supporting leg. Two weight transfers per stride.
-    this.height = (lerp(-.045, -.095, run) - Math.sin(this.phase * TAU * 2) * lerp(.03, .065, run))
-      * this.weight - impact * .13
+    this.height = (lerp(-.035, -.095, run) - Math.sin(this.phase * TAU * 2) * lerp(.022, .065, run))
+      * this.weight - lateral * .045 * this.weight - impact * .13
     this.neck = -this.pitch * .4
     this.head = -this.pitch * .25
-    this.facing.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, heading)
     this.forward.set(0, 0, 1).applyQuaternion(this.facing)
     this.inverse.copy(rotation).invert()
     this.delta.set(0, 0, 1).applyQuaternion(rotation)
     const pelvisPitch = Math.atan2(-this.delta.y, Math.hypot(this.delta.x, this.delta.z))
-    const stance = lerp(.62, .40, run)
+    const stance = lerp(.62 + backward * .04 + lateral * .06, .40, run)
     let stepStarted = false
 
     for (let i = 0; i < 2; i++) {
@@ -226,7 +247,7 @@ export class CharacterAnimation {
         // Lift early to fold the knee through passing, then lower the heel
         // gently into contact. Zero vertical velocity at either end of swing.
         const liftPhase = t < .45 ? .5 * ease(t / .45) : .5 + .5 * ease((t - .45) / .55)
-        foot.position.y += lerp(Math.sin(Math.PI * liftPhase) ** 2 * .16,
+        foot.position.y += lerp(Math.sin(Math.PI * liftPhase) ** 2 * lerp(.12, .10, lateral),
           Math.max(0, runSwing(t, 'lift')), run) * Math.max(.5, this.weight)
         if (t === 1) foot.swinging = false
       }
@@ -242,10 +263,13 @@ export class CharacterAnimation {
       foot.pitch = damp(foot.pitch, Math.atan2(foot.normal.dot(this.forward), foot.normal.y), 12, dt)
       this.hip.set(sign * .17, -.075, 0).applyQuaternion(rotation).add(pelvis)
       this.delta.copy(foot.position).sub(this.hip).applyQuaternion(this.inverse)
-      // Two-bone sagittal IK; clamp reach to avoid straight-knee singularities.
+      // Resolve lateral abduction before sagittal IK so side steps retain
+      // their support height and do not force a straight, sliding knee.
       const upper = .455, lower = .45
       const reach = upper + lower - .008
-      const down = clamp(-this.delta.y, .25, reach - .001)
+      const vertical = Math.max(.25, -this.delta.y)
+      pose.hipRoll = clamp(-Math.atan2(this.delta.x - sign * .055, vertical), -.5, .5)
+      const down = clamp(Math.hypot(vertical, this.delta.x - sign * .055), .25, reach - .001)
       // Preserve the support height when a long stride exceeds leg reach.
       // Clamping the total distance alone shortens the leg above the surface.
       const reachForward = Math.sqrt(Math.max(0, reach * reach - down * down))
@@ -265,41 +289,57 @@ export class CharacterAnimation {
         pose.hip = lerp(pose.hip, runSwing(foot.progress, 'hip') - pelvisPitch, recovery)
         pose.knee = lerp(pose.knee, clamp(runSwing(foot.progress, 'knee'), .06, 2.45), recovery)
       }
-      pose.hipRoll = clamp(-Math.atan2(this.delta.x - sign * .055, down), -.22, .22)
       const heelStrike = swinging ? -.16 * smoothstep(foot.progress, .55, .92)
         : -.16 * (1 - smoothstep(foot.stanceTime, 0, .12))
       const toeOff = swinging ? .26 * (1 - smoothstep(foot.progress, 0, .45))
         : .26 * smoothstep(cycle / stance, .68, 1)
-      const walkingSole = heelStrike + toeOff
+      // Backward steps land on the forefoot and release through the heel;
+      // lateral steps keep the sole nearly level for a stable shuffle.
+      const walkingSole = (heelStrike + toeOff) * (1 - lateral * .85) * (1 - backward * 1.7)
       const runningSole = swinging ? runSwing(foot.progress, 'sole')
         : lerp(-.20, .55, smoothstep(cycle / stance, .15, 1))
       const sole = foot.pitch + lerp(walkingSole, runningSole, run) * this.weight
         - (pelvisPitch + pose.hip + pose.knee)
       pose.ankle = clamp(sole * .35, -.28, .28)
-      pose.ankleRoll = -pose.hipRoll * .6
+      pose.ankleRoll = clamp(-pose.hipRoll, -.28, .28)
       pose.foot = clamp(sole - pose.ankle, -.62, .72)
       // Follow the actual leg drive so the arms remain opposed to the knees
       // through heel recovery, steering and the return to terrain contact.
       const legSwing = -Math.atan2(this.delta.z, down)
       const armSwing = lerp(clamp(-legSwing, -.55, .55), clamp(-pose.hip * .9 - .18, -.85, .85), run)
       pose.shoulder = damp(pose.shoulder, armSwing * this.weight, lerp(12, 24, run), dt)
-      pose.shoulderRoll = -sign * this.twist * .4
-      pose.upperArm = lerp(-.25, -.13, run) + Math.min(Math.abs(turnRate), 3) * .025
+      pose.shoulderRoll = -sign * this.twist * .4 + this.travelSide * wave * .055 * this.weight
+      pose.upperArm = lerp(-.25 - lateral * .06, -.13, run) + Math.min(Math.abs(turnRate), 3) * .025
       pose.elbow = -.16 - this.weight * lerp(.18, 1.12, run) - Math.max(0, -pose.shoulder) * .30
       pose.wrist = lerp(-.04, -.10, run) - pose.shoulder * .12
     }
   }
 
   fly(dt: number, glide: number, pitchInput: number, bank: number, verticalSpeed: number,
-    launch: number, approach: number, speed: number) {
+    launch: number, approach: number, speed: number, forward = 1, side = 0, boost = 1) {
     this.time += dt
     const breath = Math.sin(this.time * 2.1) * .012
     const landing = smoothstep(approach, 0, 1)
     const cruise = glide * (1 - landing)
-    this.pitch = damp(this.pitch, lerp(-.06, 1.25 + pitchInput * .7, cruise)
+    this.airForward = damp(this.airForward, clamp(forward, -1, 1), 7, dt)
+    this.airSide = damp(this.airSide, clamp(side, -1, 1), 7, dt)
+    this.airBoost = damp(this.airBoost, clamp(boost, 0, 1), 5, dt)
+    const fast = this.airBoost
+    const ahead = Math.max(0, this.airForward)
+    const back = Math.max(0, -this.airForward)
+    const lateral = Math.abs(this.airSide)
+    const drive = cruise * fast
+    // Slow flight stays upright, with a small lean into travel. Fast forward
+    // flight stretches into the Superman pose; reverse and side flight brace
+    // against the airflow while leaving room for the head to track the view.
+    const travelPitch = clamp(this.airForward * lerp(.22, 1.25, fast)
+      + pitchInput * ahead * fast, pitchInput - 1.2, pitchInput + 1.25)
+    this.pitch = damp(this.pitch, lerp(-.06, travelPitch, cruise)
       - clamp(verticalSpeed * .008, -.04, .06) + landing * .1, 4.5, dt)
-    this.roll = damp(this.roll, bank, 4, dt)
-    this.twist = damp(this.twist, -bank * .13, 5, dt)
+    // Reverse flight uses a seated brace instead of leaning past the neck's reach.
+    this.pitch = Math.max(-.48, Math.min(1.30, this.pitch))
+    this.roll = damp(this.roll, bank * .5 - this.airSide * cruise * lerp(.18, .48, fast), 4, dt)
+    this.twist = damp(this.twist, -bank * .13 - this.airSide * cruise * .08, 5, dt)
     this.height = 0
     // Counter-rotate the head so the character looks ahead during a glide.
     this.neck = clamp(-this.pitch * .24, -.3, .12)
@@ -310,19 +350,27 @@ export class CharacterAnimation {
       const trail = Math.sin(this.time * 2.4 + i * 1.3) * .025 * smoothstep(speed, 1, 12)
       // Reference silhouette: one long trailing leg and one softly tucked
       // knee. Keep that asymmetry stable instead of pedalling in midair.
-      const tucked = i === 0 ? 1 : 0
-      pose.hip = lerp(.08 - tucked * .34 - launch * .18 + cruise * .06 + trail, -.12, landing)
-      pose.hipRoll = -sign * .025 + bank * .04
-      pose.knee = lerp(.14 + tucked * .44 + launch * .28 - cruise * .06, .24, landing)
+      const leading = lateral > .1 ? smoothstep(sign * this.airSide, -.4, .4) : i === 0 ? 1 : 0
+      const tucked = lerp(i === 0 ? 1 : 0, 1 - leading, lateral)
+      pose.hip = lerp(.08 - tucked * .34 - launch * .18 + drive * ahead * .06
+        - back * cruise * lerp(.20, .46, fast) - leading * lateral * drive * .12 + trail, -.12, landing)
+      pose.hipRoll = (-sign * (.025 + lateral * cruise * .08) + this.airSide * cruise * .14 + bank * .04) * (1 - landing)
+      pose.knee = lerp(.14 + tucked * .44 + launch * .28 - drive * ahead * .06
+        + back * cruise * lerp(.12, .32, fast) + lateral * drive * .10, .24, landing)
       pose.ankle = lerp(.06, -.04, landing)
-      pose.ankleRoll = -bank * .04
-      pose.foot = lerp(.24 + cruise * .1 - tucked * .08, -.12, landing)
+      pose.ankleRoll = clamp(-pose.hipRoll * .5, -.28, .28)
+      pose.foot = lerp(.24 + drive * .1 - tucked * .08 - back * cruise * .18, -.12, landing)
       // Superman silhouette: one fist reaches forward in cruise, the other
       // arm bends alongside the torso; hovering returns to relaxed arms.
-      pose.shoulder = lerp(-.12 - cruise * (i === 0 ? 2.55 : .30) + sign * bank * .14 + breath, -.12, landing)
-      pose.shoulderRoll = -sign * .025 + bank * .04
+      pose.shoulder = lerp(-.12 - drive * ahead * (i === 0 ? 2.55 : .30)
+        - back * cruise * lerp(.25, .65, fast) - leading * lateral * drive * .55
+        + sign * bank * .14 + breath, -.12, landing)
+      pose.shoulderRoll = (-sign * (.025 + lateral * cruise * lerp(.12, .32, fast))
+        + bank * .04) * (1 - landing)
       pose.upperArm = -.16 + landing * .16 + sign * bank * .07
-      pose.elbow = -.14 - (i === 1 ? cruise * .8 : 0) - launch * .12 - landing * .18 - sign * bank * .06
+      pose.elbow = -.14 - (i === 1 ? drive * ahead * .8 : 0) - back * cruise * .55
+        - (1 - leading) * lateral * cruise * lerp(.18, .65, fast)
+        - launch * .12 - landing * .18 - sign * bank * .06
       pose.wrist = lerp(-.04, -.06, landing)
     }
   }

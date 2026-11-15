@@ -2,6 +2,7 @@
 async page => {
   await page.reload();
   await page.locator('.scene-canvas').waitFor();
+  await page.locator('.game-loading').waitFor({ state: 'detached' });
   const errors = [];
   const onError = message => { if (message.type() === 'error') errors.push(message.text()) };
   page.on('console', onError);
@@ -50,13 +51,13 @@ async page => {
       // Exercise steady full boost above the boundary walls, with finite cloth,
       // unchanged 10× speed and no accidental collision release.
       lab.touchFlight = true;
-      for (let i = 0; i < 900; i++) lab.step();
+      for (let i = 0; i < Math.round(30 / lab.world.integrationParameters.dt); i++) lab.step();
       lab.touchFlight = false;
       lab.ragdoll.controlFocus(lab.focus);
       lab.camera.position.copy(lab.focus).add(new T.Vector3(0, 0, -10));
       lab.controls.target.copy(lab.focus); lab.controls.update();
       lab.keys.add('KeyW'); lab.keys.add('ShiftLeft');
-      for (let i = 0; i < 240; i++) lab.step();
+      for (let i = 0; i < Math.round(4 / lab.world.integrationParameters.dt); i++) lab.step();
       const samples = [];
       for (let i = 0; i < 120; i++) {
         const start = performance.now();
@@ -64,7 +65,8 @@ async page => {
         samples.push(performance.now() - start);
         assert(lab.clothPositions.every(Number.isFinite), 'non-finite boosted cape');
       }
-      assert(!lab.ragdoll.isReleased && lab.ragdoll.speed > 105, 'full boost changed');
+      assert(!lab.ragdoll.isReleased && lab.ragdoll.speed > 105,
+        'full boost changed: ' + JSON.stringify({ speed: lab.ragdoll.speed, released: lab.ragdoll.isReleased, altitude: lab.ragdoll.altitude }));
       assert(lab.cloth.numParticles() === 169 && lab.cloth.numAttachments() === 13, 'physics budget or collar changed');
       const speed = lab.ragdoll.speed;
       lab.update({ ...lab.settings, playing: false });
