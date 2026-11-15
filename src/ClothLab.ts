@@ -262,10 +262,16 @@ export class ClothLab {
     const spacing = 2.7 / (COUNT - 1)
     const mass = cape ? CAPE_MASS : CLOTH_MASS
     const radius = cape ? 0.018 : 0.04
+    const clothMaterial = RAPIER.SoftBodyMaterial.uniform(this.settings.stiffness, 1)
+    if (cape) {
+      // Spring stiffness scales with frequency squared: halve the bending
+      // frequency for four times the compliance, while retaining cloth length.
+      clothMaterial.bendSoftness = { naturalFrequency: this.settings.stiffness * .3, dampingRatio: .8 }
+    }
     const desc = (cape ? capeDescription() : RAPIER.SoftBodyDesc.cloth(
       vector(-1.35, 3.75, -1.35), vector(spacing, 0, 0), vector(0, 0, spacing), COUNT, COUNT,
     ))
-      .setSoftness(this.settings.stiffness, 1)
+      .setMaterial(clothMaterial)
       .setParticleMass(mass / (COUNT * COUNT))
       .setParticleRadius(radius)
       .setSurfaceCollider(RAPIER.ColliderDesc.ball(radius).setFriction(0.85)
