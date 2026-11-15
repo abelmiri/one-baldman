@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import RAPIER from '@dimforge/rapier3d'
 import { FireEffects } from './FireEffects'
+import { DestructionArchive, type ArchivedChunk } from './DestructionArchive'
 import { breakWeakBuildingConnections } from './BuildingSupport'
 import { carveGeometry, reviveSolid, type CarveInput, type CarveOutput, type ConvexMeshData } from './LaserCarving'
 import { clipSolid, laserPlanes, laserSolid, solidGeometry, connectedGroups, subtractLaser, translatedSolid, type LaserSolid, type SolidConnections } from './LaserGeometry'
@@ -14,7 +15,7 @@ export type Destructible = {
   damaged: boolean; transform?: THREE.Object3D; stop?: () => void
   velocity?: THREE.Vector3
 }
-type Chunk = { owner: Destructible; solids: LaserSolid[]; mesh: THREE.Mesh; body?: RAPIER.RigidBody; settled?: boolean; debrisAge?: number; colliders: RAPIER.Collider[]; cells: Map<LaserSolid, RAPIER.Collider>; connections: SolidConnections }
+type Chunk = { owner: Destructible; solids: LaserSolid[]; mesh: THREE.Mesh; body?: RAPIER.RigidBody; settled?: boolean; debrisAge?: number; idleAge?: number; archiveKey?: string; archiving?: boolean; hydrating?: Promise<boolean>; colliders: RAPIER.Collider[]; cells: Map<LaserSolid, RAPIER.Collider>; connections: SolidConnections }
 type LaserHit = { collider: RAPIER.Collider; point: THREE.Vector3; direction: THREE.Vector3; eye: number; radius?: number; depth?: number }
 type Burn = {
   owner: Destructible; target: Destructible | Chunk; elapsed: number; duration: number; radius?: number; depth?: number
@@ -41,6 +42,7 @@ const MELT_TIME = 1.5
 const MAX_BURNS = 256
 const DEBRIS_LIFETIME = 30
 const DEBRIS_DISTANCE = 150
+const COLD_STORAGE_DELAY = 8
 
 /** Lazy geometry replacement: untouched scenery retains the original instanced draws. */
 export class LaserDestruction {
@@ -62,6 +64,9 @@ export class LaserDestruction {
   private carveJob?: CarveJob
   private stagedColliders?: Map<LaserSolid, RAPIER.Collider>
   private physicsMeshes = new WeakMap<LaserSolid, ConvexMeshData>()
+  private archive = new DestructionArchive()
+  private archiveIndex = 0
+  private generation = 0
   private burnHeat = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BURNS), 1)
   private burnMarks: THREE.InstancedMesh<THREE.CircleGeometry, THREE.ShaderMaterial>
   private burnPose = new THREE.Object3D()
@@ -105,6 +110,8 @@ export class LaserDestruction {
     const target = this.targets.get(collider.handle)
     const owner = target && ('owner' in target ? target.owner : target)
     if (!target || !owner) { this.igniteVegetation(point); return }
+    this.touch(owner)
+    if (this.deferUntilHot(owner, () => this.ignite(collider, point, direction, normal))) return
     if (owner.kind === 'car') {
       if (!owner.damaged) {
         this.shatter(owner, point, direction, 28)
@@ -134,6 +141,8 @@ export class LaserDestruction {
     const target = this.targets.get(collider.handle)
     const owner = target && ('owner' in target ? target.owner : target)
     if (!target || !owner) return
+    this.touch(owner)
+    if (this.deferUntilHot(owner, () => this.queueContact(collider, point, normal, speed))) return
     if (owner.kind !== 'building') {
       if (speed * 3.6 > 50 && !owner.damaged) this.shatter(owner, point, normal.clone().negate(), speed)
       return
@@ -159,6 +168,8 @@ export class LaserDestruction {
     const owner = target && ('owner' in target ? target.owner : target)
     const distance = from.distanceTo(to)
     if (!target || owner?.kind !== 'building' || distance < 1e-6 || this.burns.length >= MAX_BURNS) return
+    this.touch(owner)
+    if (this.deferUntilHot(owner, () => this.queueFlightPath(collider, from, to, normal))) return
     if (!this.flightTargets.has(owner)) {
       const bounds = new THREE.Box3()
       for (const part of owner.parts) {
@@ -306,7 +317,7 @@ export class LaserDestruction {
       mesh.position.copy(center)
       const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(center.x, center.y, center.z)
         .setLinearDamping(.12).setAngularDamping(.18).setCcdEnabled(true))
-      const chunk: Chunk = { owner, solids, mesh, body, colliders: [], cells: new Map(), connections: new Map() }
+      const chunk: Chunk = { owner, solids, mesh, body, debrisAge: 0, colliders: [], cells: new Map(), connections: new Map() }
       this.updateColliders(chunk)
       const outward = center.clone().sub(point).normalize()
       const velocity = owner.velocity?.clone() ?? new THREE.Vector3()
@@ -590,8 +601,87 @@ export class LaserDestruction {
     return target && ('owner' in target ? target.owner : target)
   }
 
+  /** Keep active CSG hot; only idle grounded replacements are eligible for archiving. */
+  private touch(owner: Destructible) {
+    for (const chunk of this.chunks) if (chunk.owner === owner) chunk.idleAge = 0
+  }
+
+  private deferUntilHot(owner: Destructible, action: () => void) {
+    const cold = this.chunks.filter(chunk => chunk.owner === owner && (chunk.archiveKey || chunk.hydrating))
+    if (!cold.length) return false
+    const generation = this.generation, world = this.world
+    void Promise.all(cold.map(chunk => this.hydrateChunk(chunk))).then(ready => {
+      if (ready.every(Boolean) && generation === this.generation && world === this.world) action()
+    })
+    return true
+  }
+
+  private hydrateChunk(chunk: Chunk) {
+    if (!chunk.archiveKey) return chunk.hydrating ?? Promise.resolve(true)
+    if (chunk.hydrating) return chunk.hydrating
+    const key = chunk.archiveKey, archive = this.archive, generation = this.generation
+    const task = archive.load(key).then(data => {
+      if (!data || generation !== this.generation || !this.chunks.includes(chunk)) return false
+      this.restoreChunk(chunk, data)
+      chunk.archiveKey = undefined
+      chunk.idleAge = 0
+      void archive.remove(key)
+      return true
+    }).finally(() => {
+      if (chunk.hydrating === task) chunk.hydrating = undefined
+    })
+    chunk.hydrating = task
+    return task
+  }
+
+  private restoreChunk(chunk: Chunk, data: ArchivedChunk) {
+    chunk.solids = data.solids.map(reviveSolid)
+    chunk.connections = new Map(chunk.solids.map(cell => [cell, new Set<LaserSolid>()]))
+    for (let edge = 0; edge < data.edges.length; edge += 2) {
+      const a = chunk.solids[data.edges[edge]], b = chunk.solids[data.edges[edge + 1]]
+      if (!a || !b) continue
+      chunk.connections.get(a)!.add(b); chunk.connections.get(b)!.add(a)
+    }
+    chunk.cells.clear()
+    for (let pair = 0; pair < data.colliderCells.length; pair += 2) {
+      const cell = chunk.solids[data.colliderCells[pair]], collider = chunk.colliders[data.colliderCells[pair + 1]]
+      if (cell && collider?.isValid()) chunk.cells.set(cell, collider)
+    }
+  }
+
+  private async archiveChunk(chunk: Chunk) {
+    if (chunk.archiving || chunk.archiveKey || chunk.body || !chunk.solids.length) return
+    chunk.archiving = true
+    const solids = chunk.solids, generation = this.generation, archive = this.archive
+    const key = archive.key(this.archiveIndex++)
+    const colliderIndices = new Map<LaserSolid, number>()
+    for (const [cell, collider] of chunk.cells) {
+      const index = chunk.colliders.indexOf(collider)
+      if (index >= 0) colliderIndices.set(cell, index)
+    }
+    const stored = await archive.store(key, solids, chunk.connections, colliderIndices)
+    chunk.archiving = false
+    const stillIdle = (chunk.idleAge ?? 0) >= COLD_STORAGE_DELAY
+      && !this.burns.some(burn => burn.owner === chunk.owner)
+      && !this.carveJob?.sources.some(source => source.chunk === chunk)
+    if (!stored || generation !== this.generation || !this.chunks.includes(chunk)
+      || chunk.solids !== solids || !stillIdle) {
+      if (stored) void archive.remove(key)
+      if (!stored) chunk.idleAge = 0
+      return
+    }
+    chunk.archiveKey = key
+    chunk.solids = []
+    chunk.connections.clear()
+    chunk.cells.clear()
+  }
+
   /** Call after freeing the previous world; old WASM handles must never be reused. */
   reset(world: RAPIER.World) {
+    this.generation++
+    this.archive.dispose()
+    this.archive = new DestructionArchive()
+    this.archiveIndex = 0
     this.endFlightPath()
     this.fire.reset()
     this.clearCarving()
@@ -659,6 +749,20 @@ export class LaserDestruction {
       const target = this.targets.get(hit.collider.handle)
       return { ...hit, owner: target ? ('owner' in target ? target.owner : target) : undefined }
     })
+    const coldOwners = [...new Set(resolved.flatMap(hit => hit.owner
+      && this.chunks.some(chunk => chunk.owner === hit.owner && (chunk.archiveKey || chunk.hydrating)) ? [hit.owner] : []))]
+    if (coldOwners.length) {
+      const generation = this.generation, world = this.world
+      const replay = hits.map(hit => ({ ...hit, point: hit.point.clone(), direction: hit.direction.clone() }))
+      coldOwners.forEach(owner => this.touch(owner))
+      void Promise.all(coldOwners.flatMap(owner => this.chunks
+        .filter(chunk => chunk.owner === owner && (chunk.archiveKey || chunk.hydrating))
+        .map(chunk => this.hydrateChunk(chunk)))).then(ready => {
+        if (ready.every(Boolean) && generation === this.generation && world === this.world) this.cutMany(replay, interpolate)
+      })
+      return false
+    }
+    for (const hit of resolved) if (hit.owner) this.touch(hit.owner)
     const pending = new Map<Chunk, { solids: LaserSolid[]; direction: THREE.Vector3; contact: THREE.Vector3 }>()
     for (const { owner, point, direction, eye, radius, depth } of resolved) {
       if (!owner) { this.previous.delete(eye); continue }
@@ -757,7 +861,7 @@ export class LaserDestruction {
           body.setAngvel(angular, true)
         }
         next.body = body
-        if (next.owner.kind === 'building') next.debrisAge ??= 0
+        next.debrisAge ??= 0
         // Store the new cells in the body's local frame for subsequent cuts.
         next.solids = prepared?.localSolids[groupIndex] ?? cells.map(cell => translatedSolid(cell, center.clone().negate()))
         mesh.position.copy(worldCenter); mesh.quaternion.copy(rotation)
@@ -856,12 +960,20 @@ export class LaserDestruction {
     }
   }
 
-  /** Detached building pieces expire even after settling or being cut again. */
+  /** All detached debris expires even after settling or being cut again. */
   updateDebris(dt: number, character?: THREE.Vector3) {
     if (!this.world) return
     const expired = new Set<Chunk>()
     for (const chunk of this.chunks) {
-      if (chunk.owner.kind !== 'building' || !chunk.body) continue
+      if (!chunk.body) {
+        // Grounded replacement geometry must remain visible and collidable forever,
+        // but its heavy CSG topology is only needed for a future cut.
+        if (!chunk.archiveKey && !chunk.hydrating) {
+          chunk.idleAge = (chunk.idleAge ?? 0) + Math.max(0, dt)
+          if (chunk.idleAge >= COLD_STORAGE_DELAY) void this.archiveChunk(chunk)
+        }
+        continue
+      }
       chunk.debrisAge = (chunk.debrisAge ?? 0) + Math.max(0, dt)
       let distant = false
       if (character) {
@@ -884,6 +996,7 @@ export class LaserDestruction {
     for (const burn of this.burns) if (burn.duration > 0) this.drawBurn(mark++, burn)
     this.burnMarks.count = mark
     for (const chunk of expired) {
+      if (chunk.archiveKey) void this.archive.remove(chunk.archiveKey)
       for (const collider of chunk.colliders) this.targets.delete(collider.handle)
       this.world.removeRigidBody(chunk.body!)
       chunk.mesh.removeFromParent()
@@ -902,6 +1015,8 @@ export class LaserDestruction {
   }
 
   dispose() {
+    this.generation++
+    this.archive.dispose()
     this.fire.dispose()
     this.originalTreeColors.clear()
     this.endFlightPath()

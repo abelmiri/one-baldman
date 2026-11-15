@@ -7,10 +7,13 @@ async page => {
     const { LaserDestruction } = await import('/src/LaserDestruction.ts');
     const assert = (value, message) => { if (!value) throw Error(message) };
     const results = {};
-    for (const mode of ['age', 'distance', 'settled', 'recut', 'worker', 'foundation', 'tree']) {
+    const cases = ['building', 'tree', 'car'].flatMap(kind =>
+      ['age', 'distance', 'settled', 'recut'].map(mode => [kind, mode]));
+    cases.push(['building', 'worker'], ['building', 'foundation'], ['tree', 'foundation']);
+    for (const [kind, mode] of cases) {
       const world = new R.World({ x: 0, y: -9.81, z: 0 });
       const root = new T.Group(), system = new LaserDestruction(root);
-      const owner = system.create(mode === 'tree' ? 'tree' : 'building');
+      const owner = system.create(kind);
       const y = mode === 'foundation' ? 2 : 7;
       const geometry = new T.BoxGeometry(4, 4, 4);
       owner.parts.push({ geometry, matrix: new T.Matrix4().makeTranslation(0, y, 0), color: new T.Color('brown') });
@@ -18,11 +21,14 @@ async page => {
       const original = world.createCollider(R.ColliderDesc.cuboid(2, 2, 2).setTranslation(0, y, 0));
       system.register(owner, original);
       try {
-        system.cut(original, new T.Vector3(-1, y, -2), new T.Vector3(0, 0, 1));
+        if (kind !== 'building' && mode !== 'foundation') {
+          system.queueContact(original, new T.Vector3(-1, y, -2), new T.Vector3(0, 0, -1), 20);
+          assert(system.chunks.length === 10, 'prop fixture did not shatter');
+        } else system.cut(original, new T.Vector3(-1, y, -2), new T.Vector3(0, 0, 1));
         assert(system.chunks.length, 'fixture created no chunks');
-        if (mode === 'foundation' || mode === 'tree') {
+        if (mode === 'foundation') {
           system.updateDebris(31, new T.Vector3(1000, 0, 0));
-          assert(system.chunks.length, `${mode} was removed`);
+          assert(system.chunks.length && system.chunks.every(chunk => !chunk.body), `${kind} foundation was removed`);
         } else {
           if (mode === 'settled') {
             for (const chunk of system.chunks) chunk.body.sleep();
@@ -32,8 +38,11 @@ async page => {
           system.updateDebris(29, new T.Vector3(0, y, 0));
           assert(system.chunks.length, 'debris removed before 30 seconds');
           if (mode === 'recut') {
-            const collider = system.chunks[0].colliders[0];
-            system.cut(collider, new T.Vector3(1, y, -2), new T.Vector3(0, 0, 1));
+            const chunk = system.chunks[0];
+            const point = chunk.solids[0].bounds.getCenter(new T.Vector3());
+            if (chunk.body) point.applyQuaternion(new T.Quaternion().copy(chunk.body.rotation())).add(chunk.body.translation());
+            system.cut(chunk.colliders[0], point, new T.Vector3(0, 0, 1));
+            assert(system.chunks.every(chunk => chunk.debrisAge === 29), 'recut restarted debris lifetime');
           }
           if (mode === 'worker') {
             system.ignite(system.chunks[0].colliders[0], new T.Vector3(1, y, -2),
@@ -58,7 +67,7 @@ async page => {
           assert(bodies.every(handle => !world.getRigidBody(handle)), 'body survived cleanup');
           assert(!system.carveJob && !system.burns.length, 'pending burn or worker survived cleanup');
         }
-        results[mode] = 'passed';
+        results[`${kind}-${mode}`] = 'passed';
       } finally {
         system.dispose(); world.free(); geometry.dispose();
       }

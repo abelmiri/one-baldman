@@ -21,8 +21,11 @@ function fractureUnsupported(solids: LaserSolid[], connections: SolidConnections
     const size = bounds.getSize(new THREE.Vector3())
     // Small severed pieces already make suitable debris. Keep their exact cuts.
     if (volume < 12 || Math.max(size.x, size.y, size.z) < 8) continue
-    // Adapt the panel size for very large structures to bound subdivision cost.
-    const panelSize = Math.max(DEBRIS_SIZE, Math.max(size.x, size.y, size.z) / 6)
+    const span = Math.max(size.x, size.y, size.z)
+    // Compact low-rise buildings need fewer cuts: at most two panels per axis.
+    // Larger buildings keep the existing detail and bounded subdivision cost.
+    const compact = size.y <= 12 && Math.max(size.x, size.z) <= 24
+    const panelSize = Math.max(DEBRIS_SIZE, span / (compact ? 2 : 6))
     for (const cell of group) {
       let inset: LaserSolid | null = cell
       for (const [faceIndex, face] of cell.planes.entries()) {

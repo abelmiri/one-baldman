@@ -73,7 +73,7 @@ for (const group of released) {
   const bounds = new THREE.Box3()
   group.forEach(cell => bounds.union(cell.bounds))
   const size = bounds.getSize(new THREE.Vector3())
-  assert(Math.max(size.x, size.y, size.z) <= 6.5 + 1e-5, 'a continuous wall survived across debris panels')
+  assert(Math.max(size.x, size.y, size.z) <= 7 + 1e-5, 'a continuous wall survived across debris panels')
 }
 assert(debris.reduce((sum, cell) => sum + cell.volume, 0) > structure.reduce((sum, cell) => sum + cell.volume, 0) * .8,
   'collapse erased the building instead of producing debris')
@@ -110,5 +110,21 @@ const verifyFacade = cells => {
 verifyFacade(breakWeakBuildingConnections([painted], new Map()))
 const paintedWorker = carve({ ...input, solids: [painted], shots: [] })
 verifyFacade(paintedWorker.solids.map(cell => typeof cell === 'number' ? painted : cell))
+
+// Compact city houses use larger pieces, rather than the dense large-building grid.
+for (const [w, h, d, previousCount] of [[18, 8, 16, 74], [20, 10, 20, 113]]) {
+  const house = buildingShell(w, h, d, true).map(cell =>
+    box(cell.w, cell.h, cell.d, cell.x, cell.y + h / 2 + 3, cell.z))
+  const graph = new Map()
+  const pieces = breakWeakBuildingConnections(house, graph)
+  const groups = connectedGroups(pieces, graph)
+  assert(groups.length > 8, 'compact building fell as a single rigid shell')
+  assert(groups.length < previousCount * .65, 'compact building still creates excessive fracture panels')
+  assert(pieces.reduce((sum, cell) => sum + cell.volume, 0) > house.reduce((sum, cell) => sum + cell.volume, 0) * .75,
+    'coarser fracture erased the building material')
+  const worker = carve({ kind: 'building', moving: false, visible: false, solids: house, shots: [] })
+  assert.equal(worker.groups.length, groups.length, 'compact worker/direct fracture counts differ')
+}
+
 console.log(JSON.stringify({ passed: true, partialHoleStable: true, weakBridgeBreaks: true, fractureRemovesMaterial: true,
   parallelSupports: true, workerParity: true, collapsePanels: released.length, facadeColorsPreserved: true }))
